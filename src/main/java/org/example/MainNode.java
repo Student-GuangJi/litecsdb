@@ -1,7 +1,7 @@
 package org.example;
 
 import healpix.RangeSet;
-import org.example.demo.RocksDBServer.*;
+import org.example.RocksDBServer.*;
 import org.example.utils.HealpixUtil;
 
 import java.io.File;

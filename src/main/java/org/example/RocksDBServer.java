@@ -264,7 +264,7 @@ public class RocksDBServer implements AutoCloseable {
 
         // 初始化异步处理
         this.asyncExecutor = Executors.newSingleThreadExecutor();
-        this.indexUpdateQueue = new LinkedBlockingQueue<>(10000);
+        this.indexUpdateQueue = new LinkedBlockingQueue<>(1000000);
 
         if (config.asyncIndexing) {
             startIndexUpdateWorker(config);
