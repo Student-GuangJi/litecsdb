@@ -1,6 +1,6 @@
 package org.example;
 
-import org.example.demo.RocksDBServer.*;
+import org.example.RocksDBServer.*;
 import org.rocksdb.RocksDBException;
 
 import java.io.File;
