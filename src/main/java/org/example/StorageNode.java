@@ -98,6 +98,12 @@ public class StorageNode {
 
             long duration = System.nanoTime() - queryStart;
 
+            // 更新统计
+            PerformanceStats stats = performanceStats.get("healpix_" + healpixId);
+            if (stats != null) {
+                stats.recordIndexQuery(duration);
+            }
+
             // ✅ 打印详细统计
             System.out.println("========== 时间桶查询汇总 ==========");
             System.out.println("HEALPix ID: " + healpixId);
@@ -121,30 +127,37 @@ public class StorageNode {
                     System.nanoTime() - queryStart, queryId, "TIME_BUCKET");
         }
     }
+
+    public void buildAllTimeBucketsOffline() {
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                dbService.buildAllTimeBucketsOffline();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
     /**
      * 初始化HEALPix数据库
      */
     public boolean initializeHealpixDatabase(long healpixId, RocksDBServer.Config config) {
-        try {
-            if (!healpixDatabases.containsKey(healpixId)) {
-                // 确保目录存在
+        // 利用 computeIfAbsent 保证原子性和单次执行
+        RocksDBServer existing = healpixDatabases.computeIfAbsent(healpixId, id -> {
+            try {
                 File dbDir = new File(config.dbPath).getParentFile();
                 if (!dbDir.exists()) {
                     dbDir.mkdirs();
                 }
-
                 RocksDBServer dbService = new RocksDBServer(config);
-                healpixDatabases.put(healpixId, dbService);
                 performanceStats.put("healpix_" + healpixId, new PerformanceStats());
-                System.out.println("Initialized HEALPix database: " + healpixId + " at " + config.dbPath);
-                return true;
+                return dbService;
+            } catch (RocksDBException e) {
+                System.err.println("Failed to initialize HEALPix " + healpixId + ": " + e.getMessage());
+                return null;
             }
-            return false;
-        } catch (RocksDBException e) {
-            System.err.println("Failed to initialize HEALPix " + healpixId + ": " + e.getMessage());
-            e.printStackTrace();
-            return false;
-        }
+        });
+        return existing != null;
     }
 
     /**
@@ -201,66 +214,6 @@ public class StorageNode {
             System.err.println("Failed to get light curve for source " + sourceId + " in HEALPix " + healpixId + ": " + e.getMessage());
             e.printStackTrace();
             return Collections.emptyList();
-        }
-    }
-
-    /**
-     * 查询单个天体的Bitmap
-     */
-    public BitmapIndexEntry getBitmapIndex(long healpixId, long sourceId, String band) {
-        RocksDBServer dbService = healpixDatabases.get(healpixId);
-        if (dbService == null) {
-            return null;
-        }
-        try {
-            return dbService.getBitmapIndex(sourceId, band);
-        } catch (Exception e) {
-            System.err.println("Failed to get time bitmap for source " + sourceId + " in HEALPix " + healpixId + ": " + e.getMessage());
-            e.printStackTrace();
-            return null;
-        }
-    }
-
-    /**
-     * 使用位图索引的存在性查询（优化版本）
-     */
-    public QueryResult executeExistenceQueryWithBitmap(long healpixId, double startTime, double endTime,
-                                                       String band, int minObservations) {
-        long queryStart = System.nanoTime();
-        int queryId = queryCounter.incrementAndGet();
-
-        RocksDBServer dbService = healpixDatabases.get(healpixId);
-        if (dbService == null) {
-            System.out.println("HEALPix " + healpixId + " 数据库未初始化");
-            return new QueryResult(Collections.emptySet(), Collections.emptyMap(), 0,
-                    System.nanoTime() - queryStart, queryId, "BITMAP");
-        }
-
-        try {
-            Set<Long> candidateIds = new LinkedHashSet<>(dbService.existenceQuery(startTime, endTime, band, minObservations));
-
-            // 批量获取候选天体的元数据（直接通过healpixId定位）
-            Map<Long, RocksDBServer.StarMetadata> candidateMetadata =
-                    getStarsMetadataBatch(healpixId, candidateIds);
-
-            long duration = System.nanoTime() - queryStart;
-
-            // 更新统计
-            PerformanceStats stats = performanceStats.get("healpix_" + healpixId);
-            if (stats != null) {
-                stats.recordBitmapQuery(duration);
-            }
-
-            System.out.println("StorageNode.executeExistenceQueryWithBitmap: HEALPix " + healpixId +
-                    " 返回 " + candidateIds);
-
-            return new QueryResult(candidateIds, candidateMetadata, candidateIds.size(),
-                    duration, queryId, "BITMAP");
-
-        } catch (Exception e) {
-            System.err.println("HEALPix " + healpixId + " 位图索引查询失败: " + e.getMessage());
-            return new QueryResult(Collections.emptySet(), Collections.emptyMap(), 0,
-                    System.nanoTime() - queryStart, queryId, "BITMAP");
         }
     }
 
@@ -393,67 +346,6 @@ public class StorageNode {
 
         return result;
     }
-    /**
-     * 获取指定天体的详细信息
-     */
-    public Map<String, Object> getStarDetails(long sourceId) {
-        for (RocksDBServer dbService: healpixDatabases.values()) {
-            if (dbService == null) {
-                return Collections.emptyMap();
-            }
-            try {
-                // 获取光变曲线
-                List<RocksDBServer.LightCurvePoint> lightCurve = dbService.getLightCurve(sourceId);
-                if (!lightCurve.isEmpty()) {
-                    // 获取位图索引
-                    Map<String, RocksDBServer.BitmapIndexEntry> bitmapIndices = new HashMap<>();
-                    String[] bands = {"G", "B", "R"};
-                    for (String band : bands) {
-                        try {
-                            RocksDBServer.BitmapIndexEntry bitmapIndex = dbService.getBitmapIndex(sourceId, band);
-                            if (bitmapIndex != null) {
-                                bitmapIndices.put(band, bitmapIndex);
-                            }
-                        } catch (Exception e) {
-                            // 忽略不存在的波段索引
-                        }
-                    }
-                    Map<String, Object> details = new HashMap<>();
-                    details.put("sourceId", sourceId);
-                    details.put("lightCurve", lightCurve);
-                    details.put("lightCurveCount", lightCurve.size());
-                    details.put("bitmapIndices", bitmapIndices);
-
-                    // 计算统计信息
-                    if (!lightCurve.isEmpty()) {
-                        double minMag = Double.MAX_VALUE;
-                        double maxMag = Double.MIN_VALUE;
-                        double totalMag = 0;
-                        Map<String, Integer> bandCounts = new HashMap<>();
-
-                        for (RocksDBServer.LightCurvePoint point : lightCurve) {
-                            minMag = Math.min(minMag, point.mag);
-                            maxMag = Math.max(maxMag, point.mag);
-                            totalMag += point.mag;
-                            bandCounts.put(point.band, bandCounts.getOrDefault(point.band, 0) + 1);
-                        }
-                        details.put("minMag", minMag);
-                        details.put("maxMag", maxMag);
-                        details.put("avgMag", totalMag / lightCurve.size());
-                        details.put("bandCounts", bandCounts);
-                        // 时间范围
-                        double minTime = lightCurve.stream().mapToDouble(p -> p.time).min().orElse(0);
-                        double maxTime = lightCurve.stream().mapToDouble(p -> p.time).max().orElse(0);
-                        details.put("timeRange", new double[]{minTime, maxTime});
-                    }
-                    return details;
-                }
-            } catch (Exception e) {
-                System.err.println("获取天体详情失败: " + e.getMessage());
-            }
-        }
-        return Collections.emptyMap();
-    }
 
     /**
      * 获取性能统计
@@ -504,6 +396,33 @@ public class StorageNode {
         healpixDatabases.clear();
     }
 
+    public void forceFlushAll() {
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                dbService.forceFlush();
+            } catch (Exception e) {
+                System.err.println("Error flushing database: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 汇总该节点下所有 RocksDB 实例的逻辑和物理写入量
+     * @return double数组: [0] 逻辑写入总字节, [1] 物理写入总字节
+     */
+    public double[] getOverallWAStats() {
+        double totalLogical = 0;
+        double totalPhysical = 0;
+        for (RocksDBServer db : healpixDatabases.values()) {
+            Map<String, Double> stats = db.getWriteAmplificationStats();
+            if (stats != null && !stats.isEmpty()) {
+                totalLogical += stats.getOrDefault("logical_mb", 0.0);
+                totalPhysical += stats.getOrDefault("physical_mb", 0.0);
+            }
+        }
+        return new double[]{totalLogical, totalPhysical};
+    }
+
     // ========== 内部类 ==========
 
     public static class WriteResult {
@@ -545,16 +464,16 @@ public class StorageNode {
     }
 
     private static class PerformanceStats {
-        private long bitmapQueryCount = 0;
+        private long indexQueryCount = 0;
         private long scanQueryCount = 0;
-        private long totalBitmapQueryTimeNs = 0;
+        private long totalIndexQueryTimeNs = 0;
         private long totalScanQueryTimeNs = 0;
         private long writeCount = 0;
         private long totalWriteTimeMs = 0;
 
-        public synchronized void recordBitmapQuery(long queryTimeNs) {
-            bitmapQueryCount++;
-            totalBitmapQueryTimeNs += queryTimeNs;
+        public synchronized void recordIndexQuery(long queryTimeNs) {
+            indexQueryCount++;
+            totalIndexQueryTimeNs += queryTimeNs;
         }
 
         public synchronized void recordScanQuery(long queryTimeNs) {
@@ -569,10 +488,10 @@ public class StorageNode {
 
         public synchronized Map<String, Object> getStats() {
             Map<String, Object> stats = new HashMap<>();
-            stats.put("bitmap_query_count", bitmapQueryCount);
+            stats.put("index_query_count", indexQueryCount);
             stats.put("scan_query_count", scanQueryCount);
-            stats.put("avg_bitmap_query_time_ms",
-                    bitmapQueryCount > 0 ? (totalBitmapQueryTimeNs / bitmapQueryCount) / 1_000_000.0 : 0);
+            stats.put("avg_index_query_time_ms",
+                    indexQueryCount > 0 ? (totalIndexQueryTimeNs / indexQueryCount) / 1_000_000.0 : 0);
             stats.put("avg_scan_query_time_ms",
                     scanQueryCount > 0 ? (totalScanQueryTimeNs / scanQueryCount) / 1_000_000.0 : 0);
             stats.put("total_write_count", writeCount);

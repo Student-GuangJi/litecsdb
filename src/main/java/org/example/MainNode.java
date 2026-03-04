@@ -3,6 +3,7 @@ package org.example;
 import healpix.RangeSet;
 import org.example.RocksDBServer.*;
 import org.example.utils.HealpixUtil;
+import org.example.StorageNode.*;
 
 import java.io.File;
 import java.util.*;
@@ -14,10 +15,10 @@ import java.util.concurrent.TimeUnit;
  * MainNode - 负责数据分发和查询协调
  */
 public class MainNode {
+    private static final String basePath = "LitecsDB_Data/";
     private final List<StorageNode> storageNodes;
     private final ExecutorService distributionExecutor;
     private final int nodesCount;
-
     // HEALPix配置
     private final int level; // HEALPix 层级参数
 
@@ -34,11 +35,10 @@ public class MainNode {
      * 初始化存储节点
      */
     private void initializeStorageNodes() {
-        String basePath = "src/demo";
         for (int i = 0; i < nodesCount; i++) {
             StorageNode node = new StorageNode(i, basePath);
             storageNodes.add(node);
-            File dbDir = new File(basePath + "/node" + i);
+            File dbDir = new File(basePath + "node" + i);
             if (!dbDir.exists()) {
                 dbDir.mkdirs();
             }
@@ -75,17 +75,10 @@ public class MainNode {
                 String dbPath = healpixDir.getAbsolutePath();
                 RocksDBServer.Config config = new RocksDBServer.Config(dbPath, healpixId);
                 config.timeBucketSize = 1;
-                config.bitmapSize = 10000;
 
                 // 禁用启动时的统计和压缩
                 config.asyncIndexing = true;  // 保持异步
                 config.maxBackgroundCompactions = 2;  // 减少后台压缩线程
-
-                boolean initialized = node.initializeHealpixDatabase(healpixId, config);
-
-                if (initialized) {
-                    System.out.println("  ✓ 加载 HEALPix " + healpixId);
-                }
 
             } catch (Exception e) {
                 System.err.println("  ✗ 加载失败: " + healpixDir.getName() + " - " + e.getMessage());
@@ -133,7 +126,7 @@ public class MainNode {
 
                     CompletableFuture<Set<Long>> future = CompletableFuture.supplyAsync(() -> {
                         try {
-                            StorageNode.QueryResult nodeResult =
+                            QueryResult nodeResult =
                                     node.executeQueryWithTimeBuckets(healpixId, startTime, endTime,
                                             band, magThreshold, minObservations);
 
@@ -190,6 +183,13 @@ public class MainNode {
                     System.nanoTime() - queryStart, 0, 0);
         }
     }
+
+    public void buildAllTimeBucketsOffline() {
+        System.out.println("=== 启动分布式时间桶并行构建 ===");
+        // 可以利用你之前配置的 distributionExecutor 并行触发各个节点
+        storageNodes.parallelStream().forEach(StorageNode::buildAllTimeBucketsOffline);
+    }
+
     /**
      * 根据坐标计算HEALPix ID
      */
@@ -203,16 +203,9 @@ public class MainNode {
         }
         return node.getLightCurve(healpixId, sourceId, band);
     }
-    public BitmapIndexEntry getBitmapIndex(long healpixId, long sourceId, String band) {
-        StorageNode node = storageNodes.get((int)(healpixId % nodesCount));
-        if (node == null) {
-            return null;
-        }
-        return node.getBitmapIndex(healpixId, sourceId, band);
-    }
 
     /**
-     * 批量分发数据到存储节点
+     * 批量分发数据到存储节点（极致单线程分发版，消除上下文切换）
      */
     public DistributionResult distributeDataBatch(List<String> csvLines) {
         long startTime = System.currentTimeMillis();
@@ -222,71 +215,53 @@ public class MainNode {
 
         for (String csvLine : csvLines) {
             try {
-                RocksDBServer.LightCurvePoint point = RocksDBServer.parseFromCSV(csvLine);
-                long healpixId = calculateHealpixId(point.ra, point.dec);
+                // 仅做快速的前置字符串切分提取坐标，不创建沉重的对象
+                String[] parts = csvLine.split(",", -1);
+                if (parts.length < 14 || parts[0].equals("source_id")) continue;
+
+                double ra = Double.parseDouble(parts[1].trim());
+                double dec = Double.parseDouble(parts[2].trim());
+
+                long healpixId = calculateHealpixId(ra, dec);
                 healpixDataMap.computeIfAbsent(healpixId, k -> new ArrayList<>()).add(csvLine);
             } catch (Exception e) {
-                // 跳过解析错误的数据
+                // 跳过脏数据
             }
         }
 
-        for (long healpixId : healpixDataMap.keySet()) {
-            ensureHealpixDatabaseInitialized(healpixId);
-        }
+        int totalSuccess = 0;
+        int totalErrors = 0;
 
-        // 并行分发到存储节点
-        List<CompletableFuture<StorageNode.WriteResult>> futures = new ArrayList<>();
-
+        // 🚀 核心优化：直接在当前线程循环下发！
+        // 因为数据已经在内存中了，直接方法调用比 CompletableFuture 进出队列快 100 倍
         for (Map.Entry<Long, List<String>> entry : healpixDataMap.entrySet()) {
             long healpixId = entry.getKey();
             List<String> dataLines = entry.getValue();
+
+            ensureHealpixDatabaseInitialized(healpixId);
+
             StorageNode node = storageNodes.get((int)(healpixId % nodesCount));
-
             if (node != null) {
-                CompletableFuture<StorageNode.WriteResult> future = CompletableFuture.supplyAsync(
-                        () -> node.processDataBatch(healpixId, dataLines), distributionExecutor);
-                futures.add(future);
-            }
-        }
-
-        // 等待所有分发完成
-        CompletableFuture<Void> allFutures = CompletableFuture.allOf(
-                futures.toArray(new CompletableFuture[0])
-        );
-
-        try {
-            allFutures.get(30, TimeUnit.SECONDS); // 30秒超时
-
-            // 收集结果
-            int totalSuccess = 0;
-            int totalErrors = 0;
-            long totalDuration = 0;
-
-            for (CompletableFuture<StorageNode.WriteResult> future : futures) {
-                StorageNode.WriteResult result = future.get();
+                // 同步调用存储节点写入
+                StorageNode.WriteResult result = node.processDataBatch(healpixId, dataLines);
                 totalSuccess += result.successCount;
                 totalErrors += result.errorCount;
-                totalDuration = Math.max(totalDuration, result.durationMs);
             }
-
-            long overallDuration = System.currentTimeMillis() - startTime;
-            return new DistributionResult(totalSuccess, totalErrors, overallDuration,
-                    healpixDataMap.size(), futures.size());
-
-        } catch (Exception e) {
-            return new DistributionResult(0, csvLines.size(),
-                    System.currentTimeMillis() - startTime, 0, 0);
         }
+
+        long overallDuration = System.currentTimeMillis() - startTime;
+        return new DistributionResult(totalSuccess, totalErrors, overallDuration,
+                healpixDataMap.size(), 1);
     }
+
     private void ensureHealpixDatabaseInitialized(long healpixId) {
         StorageNode node = storageNodes.get((int)(healpixId % nodesCount));
         if (node != null) {
             // 创建数据库配置
-            String dbPath = String.format("src/demo/node%d/healpix_%d",
+            String dbPath = String.format( basePath + "node%d/healpix_%d",
                     healpixId % nodesCount, healpixId);
             RocksDBServer.Config config = new RocksDBServer.Config(dbPath, healpixId);
             config.timeBucketSize = 1;
-            config.bitmapSize = 10000;
 
             // 初始化数据库
             node.initializeHealpixDatabase(healpixId, config);
@@ -329,7 +304,7 @@ public class MainNode {
 
                     CompletableFuture<Set<Long>> future = CompletableFuture.supplyAsync(() -> {
                         try {
-                            StorageNode.QueryResult nodeResult;
+                            QueryResult nodeResult;
                             nodeResult = node.executeExistenceQueryWithScan(healpixId, startTime, endTime, band, magThreshold, minObservations);
 
                             if (nodeResult != null && nodeResult.candidateObjects != null &&
@@ -501,13 +476,13 @@ public class MainNode {
         // 执行测试
         for (int i = 0; i < iterations; i++) {
             // 索引查询
-            StorageNode.QueryResult timeBuckets =
+            QueryResult timeBuckets =
                     node.executeQueryWithTimeBuckets(testHealpixId, startTime, endTime, band, magThreshold, minObservations);
             timeBucketsTimes.add(timeBuckets.getQueryTimeMs());
             if (timeBucketsResults == null) timeBucketsResults = timeBuckets.candidateObjects;
 
             // 全表扫描查询
-            StorageNode.QueryResult scanResult =
+            QueryResult scanResult =
                     node.executeExistenceQueryWithScan(testHealpixId, startTime, endTime, band, magThreshold, minObservations);
             scanTimes.add(scanResult.getQueryTimeMs());
             if (scanResults == null) scanResults = scanResult.candidateObjects;
@@ -554,22 +529,6 @@ public class MainNode {
 
         return result;
     }
-
-    /**
-     * 获取指定天体的详细信息
-     */
-    public Map<String, Object> getStarDetails(long sourceId) {
-        // 计算sourceId对应的HEALPix ID（需要知道坐标，这里需要先获取元数据）
-        // 这里我们暂时保留原来的遍历方式，或者可以修改为更高效的方式
-        for (StorageNode node : storageNodes) {
-            Map<String, Object> details = node.getStarDetails(sourceId);
-            if (!details.isEmpty()) {
-                return details;
-            }
-        }
-        return Collections.emptyMap();
-    }
-
     /**
      * 获取系统状态
      */
@@ -596,6 +555,26 @@ public class MainNode {
         for (StorageNode node : storageNodes) {
             node.shutdown();
         }
+    }
+
+    public void forceFlushAll() {
+        for (StorageNode node : storageNodes) {
+            node.forceFlushAll();
+        }
+    }
+
+    /**
+     * 获取整个分布式系统的全局写放大系数 (WA)
+     */
+    public double getOverallWriteAmplification() {
+        double totalLogical = 0;
+        double totalPhysical = 0;
+        for (StorageNode node : storageNodes) {
+            double[] stats = node.getOverallWAStats();
+            totalLogical += stats[0];
+            totalPhysical += stats[1];
+        }
+        return totalLogical > 0 ? totalPhysical / totalLogical : 1.0;
     }
 
     // ========== 内部类 ==========
@@ -639,23 +618,23 @@ public class MainNode {
     }
 
     public static class PerformanceComparisonResult {
-        public final List<Double> bitmapQueryTimes; // ms
+        public final List<Double> indexQueryTimes; // ms
         public final List<Double> scanQueryTimes;   // ms
         public final boolean resultsMatch;
-        public final int bitmapResultCount;
+        public final int indexResultCount;
         public final int scanResultCount;
 
-        public PerformanceComparisonResult(List<Double> bitmapQueryTimes, List<Double> scanQueryTimes,
-                                           boolean resultsMatch, int bitmapResultCount, int scanResultCount) {
-            this.bitmapQueryTimes = bitmapQueryTimes;
+        public PerformanceComparisonResult(List<Double> indexQueryTimes, List<Double> scanQueryTimes,
+                                           boolean resultsMatch, int indexResultCount, int scanResultCount) {
+            this.indexQueryTimes = indexQueryTimes;
             this.scanQueryTimes = scanQueryTimes;
             this.resultsMatch = resultsMatch;
-            this.bitmapResultCount = bitmapResultCount;
+            this.indexResultCount = indexResultCount;
             this.scanResultCount = scanResultCount;
         }
 
-        public double getAvgBitmapTime() {
-            return bitmapQueryTimes.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        public double getAvgIndexTime() {
+            return indexQueryTimes.stream().mapToDouble(Double::doubleValue).average().orElse(0);
         }
 
         public double getAvgScanTime() {
@@ -664,8 +643,8 @@ public class MainNode {
 
         public double getSpeedupRatio() {
             double avgScan = getAvgScanTime();
-            double avgBitmap = getAvgBitmapTime();
-            return avgScan > 0 ? avgScan / avgBitmap : 0;
+            double avgIndex = getAvgIndexTime();
+            return avgScan > 0 ? avgScan / avgIndex : 0;
         }
     }
 }

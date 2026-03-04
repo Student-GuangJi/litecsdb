@@ -1,14 +1,14 @@
 package org.example;
 
+import org.example.utils.StorageUtils;
 import org.rocksdb.*;
 import org.rocksdb.util.SizeUnit;
 
 import java.util.*;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 /**
  * 天文光变曲线RocksDB服务 - 针对HEALPix分区的分布式存储系统设计
@@ -19,199 +19,44 @@ public class RocksDBServer implements AutoCloseable {
     private final String dbPath;
     private final long healpixId; // 当前实例负责的HEALPix天区ID
     private final Config config;
+    private final Map<Long, StarMetadata> metadataCache = new ConcurrentHashMap<>();
 
     // 列族句柄
     private final ColumnFamilyHandle defaultHandle;
     private final ColumnFamilyHandle lightcurveHandle;
-    private final ColumnFamilyHandle bitmapIndexHandle;
     private final ColumnFamilyHandle metadataHandle;
     private final ColumnFamilyHandle timeBucketsHandle;
-
-    // 异步处理
-    private final ExecutorService asyncExecutor;
-    private final BlockingQueue<IndexUpdateTask> indexUpdateQueue;
-    private volatile boolean running = true;
 
     // 统计信息
     private final AtomicLong writeCount = new AtomicLong(0);
     private final AtomicLong readCount = new AtomicLong(0);
+    private final AtomicLong logicalBytesWritten = new AtomicLong(0);
     private final Statistics statistics;
     private final long startTime;
     // 记录时间起点：2455197.5，儒略日 2455197.5，也就是UTC时间2010年1月1日 00:00:00。
+    private final long initialDirSize;
 
-    /**
-     * 光变曲线数据点
-     */
-    public static class LightCurvePoint {
-        public final long sourceId;
-        public final long transitId;
-        public final String band;
-        public final double time; // MJD
-        public final double mag;
-        public final double flux;
-        public final double fluxError;
-        public final double fluxOverError;
-        public final boolean rejectedByPhotometry;
-        public final boolean rejectedByVariability;
-        public final int otherFlags;
-        public final long solutionId;
-
-        // 坐标信息（虽然由HEALPix分区管理，但保留用于查询）
-        public final double ra;
-        public final double dec;
-
-        public LightCurvePoint(long sourceId, double ra, double dec, long transitId,
-                               String band, double time, double mag, double flux,
-                               double fluxError, double fluxOverError,
-                               boolean rejectedByPhotometry, boolean rejectedByVariability,
-                               int otherFlags, long solutionId) {
-            this.sourceId = sourceId;
-            this.ra = ra;
-            this.dec = dec;
-            this.transitId = transitId;
-            this.band = band;
-            this.time = time;
-            this.mag = mag;
-            this.flux = flux;
-            this.fluxError = fluxError;
-            this.fluxOverError = fluxOverError;
-            this.rejectedByPhotometry = rejectedByPhotometry;
-            this.rejectedByVariability = rejectedByVariability;
-            this.otherFlags = otherFlags;
-            this.solutionId = solutionId;
+    // ==========================================
+    // 定制化应用层 MemTable 及控制阈值
+    // ==========================================
+    // 使用无符号字节比较器，严格对齐 RocksDB 原生的 BytewiseComparator
+    private static final Comparator<byte[]> UNSIGNED_BYTE_COMPARATOR = (a, b) -> {
+        int len = Math.min(a.length, b.length);
+        for (int i = 0; i < len; i++) {
+            if (a[i] != b[i]) return (a[i] & 0xFF) - (b[i] & 0xFF);
         }
-    }
+        return a.length - b.length;
+    };
 
-    /**
-     * 天体元数据类
-     */
-    public static class StarMetadata {
-        public final long sourceId;
-        public final double ra;
-        public final double dec;
-        public final int observationCount;
-        public final double avgMag;
-        public final double firstObsTime;
-        public final double lastObsTime;
+    // 🚀 使用 volatile 保证线程可见性，这是我们当前正在接收数据的“活跃盆”
+    private volatile ConcurrentSkipListMap<byte[], byte[]> activeMemTable = new ConcurrentSkipListMap<>(UNSIGNED_BYTE_COMPARATOR);
+    private final AtomicLong activeMemTableSize = new AtomicLong(0);
 
-        public StarMetadata(long sourceId, double ra, double dec, int observationCount,
-                            double avgMag, double firstObsTime, double lastObsTime) {
-            this.sourceId = sourceId;
-            this.ra = ra;
-            this.dec = dec;
-            this.observationCount = observationCount;
-            this.avgMag = avgMag;
-            this.firstObsTime = firstObsTime;
-            this.lastObsTime = lastObsTime;
-        }
-    }
+    // 用于追踪所有后台正在执行的 Flush 任务（以便 forceFlush 时等待它们落盘）
+    private final List<CompletableFuture<Void>> pendingFlushTasks = Collections.synchronizedList(new ArrayList<>());
 
-    /**
-     * 时间桶类
-     */
-    public static class TimeBucket {
-        public final long sourceId;
-        public final String band;
-        public final double startTime;
-        public final double endTime;
-        public final double minMag;
-        public final double maxMag;
-        public final int totalCount;
-        public final int bucketIndex; // 桶的序号
-
-        public TimeBucket(long sourceId, String band, int bucketIndex,
-                          double startTime, double endTime,
-                          double minMag, double maxMag, int totalCount) {
-            this.sourceId = sourceId;
-            this.band = band;
-            this.bucketIndex = bucketIndex;
-            this.startTime = startTime;
-            this.endTime = endTime;
-            this.minMag = minMag;
-            this.maxMag = maxMag;
-            this.totalCount = totalCount;
-        }
-    }
-
-    /**
-     * 位图索引条目
-     */
-    public static class BitmapIndexEntry {
-        public final long sourceId;
-        public final String band;
-        public final BitSet timeBitmap; // 时间位图
-        public final double minMag;     // 最小星等
-        public final double maxMag;     // 最大星等
-        public final int observationCount; // 观测次数
-
-        public BitmapIndexEntry(long sourceId, String band, BitSet timeBitmap,
-                                double minMag, double maxMag, int observationCount) {
-            this.sourceId = sourceId;
-            this.band = band;
-            this.timeBitmap = timeBitmap;
-            this.minMag = minMag;
-            this.maxMag = maxMag;
-            this.observationCount = observationCount;
-        }
-    }
-
-    /**
-     * 时间桶查询结果类
-     */
-    public static class TimeBucketQueryResult {
-        public final Boolean satisfied; // null表示需要精炼
-        public final int confirmedCount;
-        public final List<TimeBucket> ambiguousBuckets;
-        public final String status;
-
-        public TimeBucketQueryResult(Boolean satisfied, int confirmedCount,
-                                     List<TimeBucket> ambiguousBuckets, String status) {
-            this.satisfied = satisfied;
-            this.confirmedCount = confirmedCount;
-            this.ambiguousBuckets = ambiguousBuckets;
-            this.status = status;
-        }
-    }
-
-    /**
-     * 配置类
-     */
-    public static class Config {
-        public String dbPath;
-        public long healpixId;
-        public long timeBucketSize = 1; // 天为单位
-        public int bitmapSize = 3650; // 位图大小（覆盖约10年）
-        public boolean asyncIndexing = true;
-        public int maxBackgroundCompactions = 4;
-        public long blockCacheSize = 2 * SizeUnit.GB;
-
-        // 时间桶参数
-        public double lambda = 0.5; // 代价函数中的权重参数
-        public double storeCost = 1.0; // 存储代价
-        public int maxBucketGap = 100; // 最大桶间隔（K参数）
-
-        public Config(String dbPath, long healpixId) {
-            this.dbPath = dbPath;
-            this.healpixId = healpixId;
-        }
-    }
-
-    /**
-     * 索引更新任务
-     */
-    private static class IndexUpdateTask {
-        public final long sourceId;
-        public final String band;
-        public final double time;
-        public final double mag;
-
-        public IndexUpdateTask(long sourceId, String band, double time, double mag) {
-            this.sourceId = sourceId;
-            this.band = band;
-            this.time = time;
-            this.mag = mag;
-        }
-    }
+    private final long MEMTABLE_FLUSH_THRESHOLD = 64 * 1024 * 1024; // 64MB 触发刷写
+    private final long MIN_SST_FILE_SIZE = 2 * 1024 * 1024;         // 2MB 最小文件约束
 
     public RocksDBServer(Config config) throws RocksDBException {
         this.healpixId = config.healpixId;
@@ -228,27 +73,27 @@ public class RocksDBServer implements AutoCloseable {
         List<ColumnFamilyDescriptor> cfDescriptors = Arrays.asList(
                 new ColumnFamilyDescriptor("default".getBytes()),
                 new ColumnFamilyDescriptor("lightcurve".getBytes()),
-                new ColumnFamilyDescriptor("bitmap_index".getBytes()),
                 new ColumnFamilyDescriptor("metadata".getBytes()),
                 new ColumnFamilyDescriptor("time_buckets".getBytes())
         );
+
+        RocksDBGlobalResourceManager globalRes = RocksDBGlobalResourceManager.getInstance();
+
+        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
+                .setBlockCache(globalRes.getBlockCache()); // 使用全局缓存
 
         // 数据库选项
         try (final DBOptions dbOptions = new DBOptions()
                 .setCreateIfMissing(true)
                 .setCreateMissingColumnFamilies(true)
-                .setMaxBackgroundCompactions(config.maxBackgroundCompactions)
-                .setStatistics(statistics)
-                .setSkipStatsUpdateOnDbOpen(true)  // 跳过启动时的统计更新
-                .setAvoidFlushDuringRecovery(true) // 恢复时避免刷盘
-                .setMaxOpenFiles(100)) {            // 限制打开文件数
+                .setEnv(globalRes.getEnv()) // 使用全局调度线程池
+                .setWriteBufferManager(globalRes.getWriteBufferManager()) // 使用全局写限制
+                .setStatistics(statistics)) {
 
             // 列族选项
             try (final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
                     .setCompressionType(CompressionType.LZ4_COMPRESSION)
-                    .setWriteBufferSize(64 * SizeUnit.MB)
-                    .setMaxWriteBufferNumber(4)
-                    .setOptimizeFiltersForHits(true)) {  // 优化过滤器
+                    .setTableFormatConfig(tableConfig)) {
 
                 List<ColumnFamilyHandle> handles = new ArrayList<>();
                 this.db = RocksDB.open(dbOptions, config.dbPath, cfDescriptors, handles);
@@ -256,135 +101,164 @@ public class RocksDBServer implements AutoCloseable {
                 // 存储列族句柄
                 this.defaultHandle = handles.get(0);
                 this.lightcurveHandle = handles.get(1);
-                this.bitmapIndexHandle = handles.get(2);
-                this.metadataHandle = handles.get(3);
-                this.timeBucketsHandle = handles.get(4);
+                this.metadataHandle = handles.get(2);
+                this.timeBucketsHandle = handles.get(3);
             }
-        }
-
-        // 初始化异步处理
-        this.asyncExecutor = Executors.newSingleThreadExecutor();
-        this.indexUpdateQueue = new LinkedBlockingQueue<>(1000000);
-
-        if (config.asyncIndexing) {
-            startIndexUpdateWorker(config);
         }
 
         // 存储配置元数据
         storeMetadata(config);
+
+        // 记录当前 HEALPix 天区目录的初始大小
+        this.initialDirSize = StorageUtils.getDirectorySize(config.dbPath);
     }
 
-    /**
-     * 启动索引更新工作线程
-     */
-    private void startIndexUpdateWorker(Config config) {
-        asyncExecutor.submit(() -> {
-            Map<String, List<IndexUpdateTask>> batchMap = new HashMap<>();
-
-            while (running || !indexUpdateQueue.isEmpty()) {
-                try {
-                    // 批量处理索引更新
-                    List<IndexUpdateTask> batch = new ArrayList<>();
-                    indexUpdateQueue.drainTo(batch, 1000);
-
-                    if (!batch.isEmpty()) {
-                        // 按(sourceId, band)分组
-                        for (IndexUpdateTask task : batch) {
-                            String key = task.sourceId + "|" + task.band;
-                            batchMap.computeIfAbsent(key, k -> new ArrayList<>()).add(task);
-                        }
-
-                        // 批量更新位图索引
-                        updateBitmapIndexBatch(batchMap, config);
-                        batchMap.clear();
-                    } else {
-                        Thread.sleep(100); // 短暂休眠
-                    }
-                } catch (Exception e) {
-                    // 记录错误，但继续运行
-                    System.err.println("Index update error: " + e.getMessage());
-                }
-            }
-        });
-    }
 
     // ========== 数据写入接口 ==========
     /**
-     * 批量写入光变曲线数据
+     * 极速写入路径：只写内存，绝不阻塞！
      */
     public void putLightCurveBatch(List<LightCurvePoint> points) throws RocksDBException {
-        try (final WriteBatch batch = new WriteBatch()) {
-            for (LightCurvePoint point : points) {
-                byte[] key = buildDataPointKey(point.sourceId, point.band, point.time);
-                byte[] value = serializeLightCurvePoint(point);
-                batch.put(lightcurveHandle, key, value);
+        long batchLogicalSize = points.size() * 90L;
 
-                // 添加到索引更新队列
-                indexUpdateQueue.offer(new IndexUpdateTask(
-                        point.sourceId, point.band, point.time, point.mag
-                ));
-            }
-            db.write(new WriteOptions(), batch);
-            writeCount.addAndGet(points.size());
-
-            // 批量更新天体元数据
-            updateStarsMetadataBatch(points);
-            // 更新时间桶
-            updateTimeBucketsForBatch(points);
+        for (LightCurvePoint point : points) {
+            String keyStr = point.sourceId + "|" + point.band + "|" + point.time;
+            byte[] key = keyStr.getBytes(StandardCharsets.UTF_8);
+            byte[] value = serializeLightCurvePoint(point);
+            // 写入当前活跃的内存表
+            activeMemTable.put(key, value);
         }
+
+        logicalBytesWritten.addAndGet(batchLogicalSize);
+        writeCount.addAndGet(points.size());
+        updateStarsMetadataBatch(points);
+
+        if (activeMemTableSize.addAndGet(batchLogicalSize) >= MEMTABLE_FLUSH_THRESHOLD) {
+            triggerAsyncFlush();
+        }
+    }
+    /**
+     * 【核心动作】：双缓冲原子切换。主线程毫秒级脱身！
+     */
+    private synchronized void triggerAsyncFlush() {
+        // 双重检查，防止并发线程重复触发
+        if (activeMemTableSize.get() < MEMTABLE_FLUSH_THRESHOLD || activeMemTable.isEmpty()) {
+            return;
+        }
+
+        // 1. 瞬间换盆：把写满的表摘下来，换上一个全新的空表给主线程继续写
+        final ConcurrentSkipListMap<byte[], byte[]> memTableToFlush = activeMemTable;
+        activeMemTable = new ConcurrentSkipListMap<>(UNSIGNED_BYTE_COMPARATOR);
+        activeMemTableSize.set(0);
+
+        // 清理已完成的旧任务引用，防止内存泄漏
+        pendingFlushTasks.removeIf(CompletableFuture::isDone);
+
+        // 2. 将摘下来的满盆扔给全局后台线程池去慢慢写 SST
+        CompletableFuture<Void> flushTask = CompletableFuture.runAsync(() -> {
+            try {
+                doFragmentedFlush(memTableToFlush);
+            } catch (RocksDBException e) {
+                System.err.println("异步碎片化 Flush 发生错误: " + e.getMessage());
+            }
+        }, RocksDBGlobalResourceManager.getInstance().getCustomAsyncFlushPool());
+
+        // 记录任务
+        pendingFlushTasks.add(flushTask);
+    }
+    /**
+     * 后台线程专属方法：执行真实的边界对齐 SST 切分与导入
+     */
+    private void doFragmentedFlush(ConcurrentSkipListMap<byte[], byte[]> memTable) throws RocksDBException {
+        if (memTable == null || memTable.isEmpty()) return;
+
+        List<String> generatedSstFiles = new ArrayList<>();
+        SstFileWriter sstFileWriter = null;
+        String currentSstPath = null;
+        long currentSstSize = 0;
+        long lastSourceId = -1;
+
+        try (EnvOptions envOptions = new EnvOptions();
+             Options options = new Options().setCompressionType(CompressionType.LZ4_COMPRESSION)) {
+
+            for (Map.Entry<byte[], byte[]> entry : memTable.entrySet()) {
+                byte[] key = entry.getKey();
+                byte[] value = entry.getValue();
+                long currentSourceId = extractSourceId(key);
+
+                if (sstFileWriter != null && currentSstSize >= MIN_SST_FILE_SIZE && currentSourceId != lastSourceId) {
+                    sstFileWriter.finish();
+                    sstFileWriter.close();
+                    generatedSstFiles.add(currentSstPath);
+                    sstFileWriter = null;
+                }
+
+                if (sstFileWriter == null) {
+                    currentSstPath = dbPath + "/fragment_" + System.nanoTime() + "_" + generatedSstFiles.size() + ".sst";
+                    sstFileWriter = new SstFileWriter(envOptions, options);
+                    sstFileWriter.open(currentSstPath);
+                    currentSstSize = 0;
+                    lastSourceId = currentSourceId;
+                }
+
+                sstFileWriter.put(key, value);
+                currentSstSize += (key.length + value.length);
+                lastSourceId = currentSourceId;
+            }
+
+            if (sstFileWriter != null) {
+                sstFileWriter.finish();
+                sstFileWriter.close();
+                generatedSstFiles.add(currentSstPath);
+            }
+
+            if (!generatedSstFiles.isEmpty()) {
+                try (IngestExternalFileOptions ingestOpts = new IngestExternalFileOptions()) {
+                    ingestOpts.setMoveFiles(true);
+                    // 使用 Java JNI 正确的方法名调用
+                    db.ingestExternalFile(lightcurveHandle, generatedSstFiles, ingestOpts);
+                }
+            }
+        }
+    }
+    /**
+     * 高效从前缀 Key 中提取 sourceId (避免 new String 产生 GC 开销)
+     */
+    private long extractSourceId(byte[] key) {
+        long id = 0;
+        for (byte b : key) {
+            if (b == '|') break;
+            id = id * 10 + (b - '0');
+        }
+        return id;
     }
 
     /**
      * 批量更新天体元数据
      */
-    private void updateStarsMetadataBatch(List<LightCurvePoint> points) throws RocksDBException {
-        Map<Long, List<LightCurvePoint>> pointsByStar = new HashMap<>();
-
-        // 按天体分组
+    private void updateStarsMetadataBatch(List<LightCurvePoint> points) {
         for (LightCurvePoint point : points) {
-            pointsByStar.computeIfAbsent(point.sourceId, k -> new ArrayList<>()).add(point);
-        }
-
-        // 批量更新每个天体的元数据
-        try (final WriteBatch batch = new WriteBatch()) {
-            for (Map.Entry<Long, List<LightCurvePoint>> entry : pointsByStar.entrySet()) {
-                long sourceId = entry.getKey();
-                List<LightCurvePoint> starPoints = entry.getValue();
-
-                // 获取现有元数据
-                byte[] key = buildStarMetadataKey(sourceId);
-                byte[] existingValue = db.get(metadataHandle, key);
-
-                StarMetadata metadata;
-                if (existingValue != null) {
-                    // 基于现有元数据更新
-                    metadata = deserializeStarMetadata(existingValue);
-                    for (LightCurvePoint point : starPoints) {
-                        metadata = new StarMetadata(
-                                metadata.sourceId,
-                                metadata.ra,
-                                metadata.dec,
-                                metadata.observationCount + 1,
-                                (metadata.avgMag * metadata.observationCount + point.mag) / (metadata.observationCount + 1),
-                                Math.min(metadata.firstObsTime, point.time),
-                                Math.max(metadata.lastObsTime, point.time)
-                        );
-                    }
-                } else {
-                    // 创建新元数据（使用第一个数据点）
-                    LightCurvePoint firstPoint = starPoints.get(0);
-                    metadata = new StarMetadata(
-                            sourceId, firstPoint.ra, firstPoint.dec,
-                            starPoints.size(), firstPoint.mag,
-                            firstPoint.time, firstPoint.time
-                    );
+            metadataCache.compute(point.sourceId, (id, existing) -> {
+                // 如果内存没有，尝试从底层捞一次（一般只发生在重启续传时）
+                if (existing == null) {
+                    try {
+                        byte[] dbVal = db.get(metadataHandle, buildStarMetadataKey(id));
+                        if (dbVal != null) existing = deserializeStarMetadata(dbVal);
+                    } catch (RocksDBException e) {}
                 }
-
-                byte[] value = serializeStarMetadata(metadata);
-                batch.put(metadataHandle, key, value);
-            }
-
-            db.write(new WriteOptions().setSync(false), batch);
+                // 在内存中完成聚合，彻底切断对 RocksDB 的频繁写入
+                if (existing != null) {
+                    return new StarMetadata(
+                            existing.sourceId, existing.ra, existing.dec,
+                            existing.observationCount + 1,
+                            (existing.avgMag * existing.observationCount + point.mag) / (existing.observationCount + 1),
+                            Math.min(existing.firstObsTime, point.time),
+                            Math.max(existing.lastObsTime, point.time)
+                    );
+                } else {
+                    return new StarMetadata(id, point.ra, point.dec, 1, point.mag, point.time, point.time);
+                }
+            });
         }
     }
 
@@ -543,7 +417,8 @@ public class RocksDBServer implements AutoCloseable {
                 batch.put(timeBucketsHandle, key, value);
             }
 
-            db.write(new WriteOptions(), batch);
+            // 关键优化：禁用 WAL，因为时间桶是派生索引，即使宕机也可以从原始数据重建，没必要双写！
+            db.write(new WriteOptions().setDisableWAL(true), batch);
         }
     }
 
@@ -568,44 +443,68 @@ public class RocksDBServer implements AutoCloseable {
     }
 
     /**
-     * 写入天体元数据
+     * 高性能离线构建时间桶索引
+     * 在所有数据写入完成后，全表顺序扫描一次，利用内存极速完成所有天体的 DP 划分
      */
-    private void putStarMetadata(LightCurvePoint point) throws RocksDBException {
-        // 检查是否已存在该天体的元数据
-        byte[] key = buildStarMetadataKey(point.sourceId);
-        byte[] existingValue = db.get(metadataHandle, key);
+    public void buildAllTimeBucketsOffline() throws RocksDBException {
+        System.out.println("开始为 HEALPix " + healpixId + " 全量顺序扫描构建时间桶...");
+        long start = System.currentTimeMillis();
+        int processedGroups = 0;
 
-        StarMetadata metadata;
-        if (existingValue != null) {
-            // 更新现有元数据
-            metadata = updateStarMetadata(existingValue, point);
-        } else {
-            // 创建新元数据
-            metadata = new StarMetadata(
-                    point.sourceId, point.ra, point.dec,
-                    1, point.mag, point.time, point.time
-            );
+        String currentPrefix = "";
+        List<LightCurvePoint> currentPoints = new ArrayList<>();
+        long currentSourceId = -1;
+        String currentBand = "";
+
+        // 利用 RocksDB 的顺序迭代器，速度极快
+        try (RocksIterator iterator = db.newIterator(lightcurveHandle)) {
+            for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                String keyStr = new String(key); // 格式: sourceId|band|time
+                String[] parts = keyStr.split("\\|");
+                if (parts.length < 3) continue;
+
+                long sourceId = Long.parseLong(parts[0]);
+                String band = parts[1];
+                String prefix = sourceId + "|" + band;
+
+                LightCurvePoint point = deserializeLightCurvePoint(iterator.value());
+
+                // 如果遇到了一个新的 (天体+波段) 组合，说明上一组已经收集齐了
+                if (!prefix.equals(currentPrefix)) {
+                    if (!currentPoints.isEmpty()) {
+                        // 1. 在内存中排序
+                        currentPoints.sort(Comparator.comparingDouble(p -> p.time));
+                        // 2. 内存中极速跑完 DP 算法
+                        List<TimeBucket> buckets = partitionTimeBuckets(currentSourceId, currentBand, currentPoints, config);
+                        // 3. 批量落盘
+                        storeTimeBuckets(currentSourceId, currentBand, buckets);
+                        processedGroups++;
+                    }
+                    // 重置收集器
+                    currentPrefix = prefix;
+                    currentSourceId = sourceId;
+                    currentBand = band;
+                    currentPoints.clear();
+                }
+                currentPoints.add(point);
+            }
+
+            // 处理最后一组数据
+            if (!currentPoints.isEmpty()) {
+                currentPoints.sort(Comparator.comparingDouble(p -> p.time));
+                List<TimeBucket> buckets = partitionTimeBuckets(currentSourceId, currentBand, currentPoints, config);
+                storeTimeBuckets(currentSourceId, currentBand, buckets);
+                processedGroups++;
+            }
         }
 
-        // 序列化并存储元数据
-        byte[] value = serializeStarMetadata(metadata);
-        db.put(metadataHandle, key, value);
-    }
-    /**
-     * 更新天体元数据
-     */
-    private StarMetadata updateStarMetadata(byte[] existingValue, LightCurvePoint newPoint) {
-        StarMetadata existing = deserializeStarMetadata(existingValue);
+        // 终极清理：刷盘并强制压缩时间桶列族，挤掉所有水分
+        db.flush(new FlushOptions().setWaitForFlush(true), timeBucketsHandle);
+        db.compactRange(timeBucketsHandle);
 
-        return new StarMetadata(
-                existing.sourceId,
-                existing.ra, // 坐标保持不变
-                existing.dec,
-                existing.observationCount + 1,
-                (existing.avgMag * existing.observationCount + newPoint.mag) / (existing.observationCount + 1),
-                Math.min(existing.firstObsTime, newPoint.time),
-                Math.max(existing.lastObsTime, newPoint.time)
-        );
+        System.out.println("HEALPix " + healpixId + " 时间桶构建完成！共处理 " + processedGroups +
+                " 个波段组，耗时: " + (System.currentTimeMillis() - start) + "ms");
     }
 
     /**
@@ -945,48 +844,6 @@ public class RocksDBServer implements AutoCloseable {
         return result;
     }
 
-    // ========== 位图索引查询 ==========
-
-    /**
-     * 存在性查询 - 使用位图索引快速筛选
-     */
-    public Set<Long> existenceQuery(double startTime, double endTime,
-                                    String band, int minObservations) throws RocksDBException {
-        // 使用LinkedHashSet确保结果有序且无重复
-        Set<Long> candidates = new LinkedHashSet<>();
-
-        try (final RocksIterator iterator = db.newIterator(bitmapIndexHandle)) {
-            for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
-                try {
-                    BitmapIndexEntry indexEntry = deserializeBitmapIndex(iterator.key(), iterator.value());
-
-                    // 检查波段匹配
-                    if (!indexEntry.band.equals(band)) continue;
-
-                    // 使用位图索引快速判断
-                    if (hasObservationsInRange(indexEntry, startTime, endTime, minObservations)) {
-                        candidates.add(indexEntry.sourceId);
-                    }
-                } catch (Exception e) {
-                    System.err.println("解析位图索引失败: " + e.getMessage());
-                    // 继续处理下一个索引条目
-                }
-            }
-        }
-
-        System.out.println("RocksDBServer.existenceQuery: 返回 " + candidates);
-        return candidates;
-    }
-    /**
-     * 获取天体的位图索引
-     */
-    public BitmapIndexEntry getBitmapIndex(long sourceId, String band) throws RocksDBException {
-        byte[] key = buildBitmapIndexKey(sourceId, band);
-        byte[] value = db.get(bitmapIndexHandle, key);
-
-        if (value == null) return null;
-        return deserializeBitmapIndex(key, value);
-    }
 
     // ========== 系统管理接口 ==========
 
@@ -1017,44 +874,12 @@ public class RocksDBServer implements AutoCloseable {
         return stats;
     }
 
-    /**
-     * 手动触发位图索引重建
-     */
-    public void rebuildBitmapIndex(Config config) throws RocksDBException {
-        Map<String, List<IndexUpdateTask>> allUpdates = new HashMap<>();
-
-        // 扫描所有数据点构建索引
-        try (final RocksIterator iterator = db.newIterator(lightcurveHandle)) {
-            for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
-                byte[] value = iterator.value();
-                LightCurvePoint point = deserializeLightCurvePoint(value);
-
-                String key = point.sourceId + "|" + point.band;
-                allUpdates.computeIfAbsent(key, k -> new ArrayList<>())
-                        .add(new IndexUpdateTask(point.sourceId, point.band, point.time, point.mag));
-            }
-        }
-
-        // 批量更新索引
-        updateBitmapIndexBatch(allUpdates, config);
-    }
-
-    /**
-     * 压缩数据库
-     */
-    public void compact() throws RocksDBException {
-        db.compactRange();
-    }
-
     @Override
     public void close() {
-        running = false;
-        asyncExecutor.shutdown();
-
         if (defaultHandle != null) defaultHandle.close();
         if (lightcurveHandle != null) lightcurveHandle.close();
-        if (bitmapIndexHandle != null) bitmapIndexHandle.close();
         if (metadataHandle != null) metadataHandle.close();
+        if (timeBucketsHandle != null) timeBucketsHandle.close();
         if (db != null) db.close();
         if (statistics != null) statistics.close();
     }
@@ -1071,9 +896,6 @@ public class RocksDBServer implements AutoCloseable {
     private byte[] buildSourceIdBandPrefix(long sourceId, String band) {
         return String.format("%d|%s|", sourceId, band).getBytes();
     }
-    private byte[] buildBitmapIndexKey(long sourceId, String band) {
-        return String.format("%d|%s", sourceId, band).getBytes();
-    }
     private byte[] buildTimeBucketPrefix(long sourceId, String band) {
         return String.format("%d|%s|", sourceId, band).getBytes();
     }
@@ -1081,177 +903,71 @@ public class RocksDBServer implements AutoCloseable {
         return String.format("%d|%s|%d", sourceId, band, bucketIndex).getBytes();
     }
     private byte[] serializeLightCurvePoint(LightCurvePoint point) {
-        // 使用紧凑的二进制格式
-        // 格式: sourceId(8),ra(8),dec(8),transitId(8),band(var),time(8),mag(8),flux(8),fluxError(8),fluxOverError(8),flags(1),solutionId(8)
-        // 实际实现应使用更高效的序列化库如Protobuf
-        String serialized = String.format("%d,%.6f,%.6f,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%b,%b,%d,%d",
-                point.sourceId, point.ra, point.dec, point.transitId, point.band,
-                point.time, point.mag, point.flux, point.fluxError, point.fluxOverError,
-                point.rejectedByPhotometry, point.rejectedByVariability,
-                point.otherFlags, point.solutionId);
-        return serialized.getBytes();
+        byte[] bandBytes = point.band.getBytes(StandardCharsets.UTF_8);
+        // 精确计算所需字节数：10个long/double(80) + 2个byte(2) + 1个int(4) + 1个长度int(4) = 90
+        int exactSize = 90 + bandBytes.length;
+        ByteBuffer buffer = ByteBuffer.allocate(exactSize);
+        buffer.putLong(point.sourceId).putDouble(point.ra).putDouble(point.dec).putLong(point.transitId);
+        buffer.putInt(bandBytes.length).put(bandBytes);
+        buffer.putDouble(point.time).putDouble(point.mag).putDouble(point.flux).putDouble(point.fluxError).putDouble(point.fluxOverError);
+        buffer.put((byte)(point.rejectedByPhotometry ? 1 : 0)).put((byte)(point.rejectedByVariability ? 1 : 0));
+        buffer.putInt(point.otherFlags).putLong(point.solutionId);
+        return buffer.array();
     }
+
     private LightCurvePoint deserializeLightCurvePoint(byte[] data) {
-        String str = new String(data);
-        String[] parts = str.split(",");
-
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        long sourceId = buffer.getLong();
+        double ra = buffer.getDouble();
+        double dec = buffer.getDouble();
+        long transitId = buffer.getLong();
+        byte[] bandBytes = new byte[buffer.getInt()];
+        buffer.get(bandBytes);
+        String band = new String(bandBytes, StandardCharsets.UTF_8);
         return new LightCurvePoint(
-                Long.parseLong(parts[0]),
-                Double.parseDouble(parts[1]),
-                Double.parseDouble(parts[2]),
-                Long.parseLong(parts[3]),
-                parts[4],
-                Double.parseDouble(parts[5]),
-                Double.parseDouble(parts[6]),
-                Double.parseDouble(parts[7]),
-                Double.parseDouble(parts[8]),
-                Double.parseDouble(parts[9]),
-                Boolean.parseBoolean(parts[10]),
-                Boolean.parseBoolean(parts[11]),
-                Integer.parseInt(parts[12]),
-                Long.parseLong(parts[13])
+                sourceId, ra, dec, transitId, band,
+                buffer.getDouble(), buffer.getDouble(), buffer.getDouble(), buffer.getDouble(), buffer.getDouble(),
+                buffer.get() == 1, buffer.get() == 1, buffer.getInt(), buffer.getLong()
         );
-    }
-    private byte[] serializeBitmapIndex(BitmapIndexEntry entry) {
-        // 序列化位图索引
-        StringBuilder sb = new StringBuilder();
-        sb.append(entry.sourceId).append(",")
-                .append(entry.band).append(",")
-                .append(entry.minMag).append(",")
-                .append(entry.maxMag).append(",")
-                .append(entry.observationCount).append(",")
-                .append(bitSetToString(entry.timeBitmap));
-        return sb.toString().getBytes();
-    }
-    private BitmapIndexEntry deserializeBitmapIndex(byte[] key, byte[] value) {
-        String keyStr = new String(key);
-        String[] keyParts = keyStr.split("\\|");
-        long sourceId = Long.parseLong(keyParts[0]);
-        String band = keyParts[1];
-
-        String valueStr = new String(value);
-        String[] valueParts = valueStr.split(",");
-
-        double minMag = Double.parseDouble(valueParts[2]);
-        double maxMag = Double.parseDouble(valueParts[3]);
-        int observationCount = Integer.parseInt(valueParts[4]);
-        BitSet timeBitmap = stringToBitSet(valueParts[5]);
-
-        return new BitmapIndexEntry(sourceId, band, timeBitmap, minMag, maxMag, observationCount);
     }
     private byte[] buildStarMetadataKey(long sourceId) {
         return ("star_" + sourceId).getBytes();
     }
-    private byte[] serializeStarMetadata(StarMetadata metadata) {
-        String serialized = String.format("%d,%.6f,%.6f,%d,%.3f,%.3f,%.3f",
-                metadata.sourceId, metadata.ra, metadata.dec, metadata.observationCount,
-                metadata.avgMag, metadata.firstObsTime, metadata.lastObsTime);
-        return serialized.getBytes();
+    private byte[] serializeStarMetadata(StarMetadata meta) {
+        ByteBuffer buffer = ByteBuffer.allocate(52); // 8*6 + 4 = 52 bytes
+        buffer.putLong(meta.sourceId).putDouble(meta.ra).putDouble(meta.dec);
+        buffer.putInt(meta.observationCount).putDouble(meta.avgMag);
+        buffer.putDouble(meta.firstObsTime).putDouble(meta.lastObsTime);
+        return buffer.array();
     }
-    private StarMetadata deserializeStarMetadata(byte[] data) {
-        String str = new String(data);
-        String[] parts = str.split(",");
 
+    private StarMetadata deserializeStarMetadata(byte[] data) {
+        ByteBuffer buffer = ByteBuffer.wrap(data);
         return new StarMetadata(
-                Long.parseLong(parts[0]),
-                Double.parseDouble(parts[1]),
-                Double.parseDouble(parts[2]),
-                Integer.parseInt(parts[3]),
-                Double.parseDouble(parts[4]),
-                Double.parseDouble(parts[5]),
-                Double.parseDouble(parts[6])
+                buffer.getLong(), buffer.getDouble(), buffer.getDouble(),
+                buffer.getInt(), buffer.getDouble(), buffer.getDouble(), buffer.getDouble()
         );
     }
     private byte[] serializeTimeBucket(TimeBucket bucket) {
-        String serialized = String.format("%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%d",
-                bucket.sourceId, bucket.band, bucket.bucketIndex,
-                bucket.startTime, bucket.endTime,
-                bucket.minMag, bucket.maxMag, bucket.totalCount);
-        return serialized.getBytes();
+        byte[] bandBytes = bucket.band.getBytes(StandardCharsets.UTF_8);
+        // 精确计算容量: 8(id)+4(长度)+bandBytes+4(index)+8(start)+8(end)+8(min)+8(max)+4(count) = 52 + band长度
+        ByteBuffer buffer = ByteBuffer.allocate(52 + bandBytes.length);
+        buffer.putLong(bucket.sourceId).putInt(bandBytes.length).put(bandBytes);
+        buffer.putInt(bucket.bucketIndex).putDouble(bucket.startTime).putDouble(bucket.endTime);
+        buffer.putDouble(bucket.minMag).putDouble(bucket.maxMag).putInt(bucket.totalCount);
+        return buffer.array();
     }
+
     private TimeBucket deserializeTimeBucket(byte[] data) {
-        String str = new String(data);
-        String[] parts = str.split(",");
-
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        long sourceId = buffer.getLong();
+        byte[] bandBytes = new byte[buffer.getInt()];
+        buffer.get(bandBytes);
+        String band = new String(bandBytes, StandardCharsets.UTF_8);
         return new TimeBucket(
-                Long.parseLong(parts[0]),
-                parts[1],
-                Integer.parseInt(parts[2]),
-                Double.parseDouble(parts[3]),
-                Double.parseDouble(parts[4]),
-                Double.parseDouble(parts[5]),
-                Double.parseDouble(parts[6]),
-                Integer.parseInt(parts[7])
+                sourceId, band, buffer.getInt(), buffer.getDouble(), buffer.getDouble(),
+                buffer.getDouble(), buffer.getDouble(), buffer.getInt()
         );
-    }
-    // ========== 位图索引维护 ==========
-
-    private void updateBitmapIndexBatch(Map<String, List<IndexUpdateTask>> batchMap, Config config)
-            throws RocksDBException {
-        try (final WriteBatch batch = new WriteBatch()) {
-            for (Map.Entry<String, List<IndexUpdateTask>> entry : batchMap.entrySet()) {
-                String[] keyParts = entry.getKey().split("\\|");
-                long sourceId = Long.parseLong(keyParts[0]);
-                String band = keyParts[1];
-
-                // 获取现有索引或创建新索引
-                BitmapIndexEntry existingIndex = getBitmapIndex(sourceId, band);
-                BitmapIndexEntry updatedIndex = updateBitmapIndex(existingIndex, entry.getValue(), config);
-
-                // 写入更新后的索引
-                byte[] key = buildBitmapIndexKey(sourceId, band);
-                byte[] value = serializeBitmapIndex(updatedIndex);
-                batch.put(bitmapIndexHandle, key, value);
-            }
-            db.write(new WriteOptions().setSync(false), batch);
-        }
-    }
-
-    private BitmapIndexEntry updateBitmapIndex(BitmapIndexEntry existing, List<IndexUpdateTask> updates, Config config) {
-        long sourceId = updates.get(0).sourceId;
-        String band = updates.get(0).band;
-
-        BitSet timeBitmap = (existing != null) ? existing.timeBitmap : new BitSet(config.bitmapSize);
-        double minMag = (existing != null) ? existing.minMag : Double.MAX_VALUE;
-        double maxMag = (existing != null) ? existing.maxMag : Double.MIN_VALUE;
-        int observationCount = (existing != null) ? existing.observationCount : 0;
-
-        for (IndexUpdateTask task : updates) {
-            // 更新时间位图
-            int timeBucket = (int) (task.time / config.timeBucketSize);
-            if (timeBucket >= 0 && timeBucket < config.bitmapSize) {
-                timeBitmap.set(timeBucket);
-            }
-
-            // 更新星等范围
-            minMag = Math.min(minMag, task.mag);
-            maxMag = Math.max(maxMag, task.mag);
-            observationCount++;
-        }
-
-        return new BitmapIndexEntry(sourceId, band, timeBitmap, minMag, maxMag, observationCount);
-    }
-
-    private boolean hasObservationsInRange(BitmapIndexEntry index, double startTime, double endTime,
-                                           int minObservations) {
-        int startBucket = (int) (startTime / config.timeBucketSize);
-        int endBucket = (int) (endTime / config.timeBucketSize);
-
-        startBucket = Math.max(0, startBucket);
-        endBucket = Math.min(config.bitmapSize - 1, endBucket);
-
-        // 计算时间范围内的设置位数
-        int count = 0;
-        for (int i = startBucket; i <= endBucket; i++) {
-            if (index.timeBitmap.get(i)) {
-                count++;
-                if (count >= minObservations) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
     }
 
     // ========== 工具方法 ==========
@@ -1291,10 +1007,232 @@ public class RocksDBServer implements AutoCloseable {
         metadata.put("healpix_id", String.valueOf(config.healpixId));
         metadata.put("creation_time", String.valueOf(System.currentTimeMillis()));
         metadata.put("time_bucket_size", String.valueOf(config.timeBucketSize));
-        metadata.put("bitmap_size", String.valueOf(config.bitmapSize));
 
         for (Map.Entry<String, String> entry : metadata.entrySet()) {
             db.put(metadataHandle, entry.getKey().getBytes(), entry.getValue().getBytes());
         }
     }
+
+
+    // ========== 实验专供：底层物理性能与写放大统计 ==========
+
+    /**
+     * 获取存储引擎的写放大(Write Amplification)指标
+     * 公式: (Flush写入字节 + Compaction写入字节) / 应用层逻辑写入字节
+     */
+    public Map<String, Double> getWriteAmplificationStats() {
+        Map<String, Double> stats = new HashMap<>();
+        try {
+            long logicalBytes = logicalBytesWritten.get();
+
+            long currentDirSize = StorageUtils.getDirectorySize(dbPath);
+            long physicalBytes = currentDirSize - initialDirSize;
+
+            double wa = logicalBytes > 0 ? (double) physicalBytes / logicalBytes : 1.0;
+
+            stats.put("logical_mb", logicalBytes / 1048576.0);
+            stats.put("physical_mb", physicalBytes / 1048576.0);
+            stats.put("write_amplification", wa);
+            return stats;
+        } catch (Exception e) {
+            System.err.println("无法获取写放大统计: " + e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * 实验结束时的强制收尾操作
+     */
+    public void forceFlush() throws RocksDBException {
+        // 1. 先把当前活跃表（哪怕没装满）强行切分导入
+        synchronized (this) {
+            if (!activeMemTable.isEmpty()) {
+                final ConcurrentSkipListMap<byte[], byte[]> memTableToFlush = activeMemTable;
+                activeMemTable = new ConcurrentSkipListMap<>(UNSIGNED_BYTE_COMPARATOR);
+                activeMemTableSize.set(0);
+                doFragmentedFlush(memTableToFlush); // 主线程直接执行最后一波
+            }
+        }
+
+        // 2. 阻塞等待所有后台 Flush 任务完成，确保所有数据已经落盘
+        CompletableFuture<Void> allTasks = CompletableFuture.allOf(
+                pendingFlushTasks.toArray(new CompletableFuture[0]));
+        try {
+            allTasks.join();
+        } catch (Exception e) {}
+
+        // 3. 内存聚合的元数据落盘
+        if (!metadataCache.isEmpty()) {
+            try (WriteBatch batch = new WriteBatch()) {
+                for (StarMetadata meta : metadataCache.values()) {
+                    batch.put(metadataHandle, buildStarMetadataKey(meta.sourceId), serializeStarMetadata(meta));
+                }
+                db.write(new WriteOptions().setDisableWAL(true), batch);
+            }
+            metadataCache.clear();
+        }
+
+        // 4. 原生刷盘与合并（清除由于元数据写入产生的碎片）
+        FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true);
+        db.flush(flushOptions, defaultHandle);
+        db.flush(flushOptions, metadataHandle);
+
+        db.compactRange(defaultHandle);
+        db.compactRange(lightcurveHandle); // 对 Ingest 进来的文件做一次物理合并对齐
+        db.compactRange(metadataHandle);
+    }
+
+    // ========== 类定义区 ==========
+
+    /**
+     * 光变曲线数据点
+     */
+    public static class LightCurvePoint {
+        public final long sourceId;
+        public final long transitId;
+        public final String band;
+        public final double time; // MJD
+        public final double mag;
+        public final double flux;
+        public final double fluxError;
+        public final double fluxOverError;
+        public final boolean rejectedByPhotometry;
+        public final boolean rejectedByVariability;
+        public final int otherFlags;
+        public final long solutionId;
+
+        // 坐标信息（虽然由HEALPix分区管理，但保留用于查询）
+        public final double ra;
+        public final double dec;
+
+        public LightCurvePoint(long sourceId, double ra, double dec, long transitId,
+                               String band, double time, double mag, double flux,
+                               double fluxError, double fluxOverError,
+                               boolean rejectedByPhotometry, boolean rejectedByVariability,
+                               int otherFlags, long solutionId) {
+            this.sourceId = sourceId;
+            this.ra = ra;
+            this.dec = dec;
+            this.transitId = transitId;
+            this.band = band;
+            this.time = time;
+            this.mag = mag;
+            this.flux = flux;
+            this.fluxError = fluxError;
+            this.fluxOverError = fluxOverError;
+            this.rejectedByPhotometry = rejectedByPhotometry;
+            this.rejectedByVariability = rejectedByVariability;
+            this.otherFlags = otherFlags;
+            this.solutionId = solutionId;
+        }
+    }
+
+    /**
+     * 天体元数据类
+     */
+    public static class StarMetadata {
+        public final long sourceId;
+        public final double ra;
+        public final double dec;
+        public final int observationCount;
+        public final double avgMag;
+        public final double firstObsTime;
+        public final double lastObsTime;
+
+        public StarMetadata(long sourceId, double ra, double dec, int observationCount,
+                            double avgMag, double firstObsTime, double lastObsTime) {
+            this.sourceId = sourceId;
+            this.ra = ra;
+            this.dec = dec;
+            this.observationCount = observationCount;
+            this.avgMag = avgMag;
+            this.firstObsTime = firstObsTime;
+            this.lastObsTime = lastObsTime;
+        }
+    }
+
+    /**
+     * 时间桶类
+     */
+    public static class TimeBucket {
+        public final long sourceId;
+        public final String band;
+        public final double startTime;
+        public final double endTime;
+        public final double minMag;
+        public final double maxMag;
+        public final int totalCount;
+        public final int bucketIndex; // 桶的序号
+
+        public TimeBucket(long sourceId, String band, int bucketIndex,
+                          double startTime, double endTime,
+                          double minMag, double maxMag, int totalCount) {
+            this.sourceId = sourceId;
+            this.band = band;
+            this.bucketIndex = bucketIndex;
+            this.startTime = startTime;
+            this.endTime = endTime;
+            this.minMag = minMag;
+            this.maxMag = maxMag;
+            this.totalCount = totalCount;
+        }
+    }
+
+    /**
+     * 时间桶查询结果类
+     */
+    public static class TimeBucketQueryResult {
+        public final Boolean satisfied; // null表示需要精炼
+        public final int confirmedCount;
+        public final List<TimeBucket> ambiguousBuckets;
+        public final String status;
+
+        public TimeBucketQueryResult(Boolean satisfied, int confirmedCount,
+                                     List<TimeBucket> ambiguousBuckets, String status) {
+            this.satisfied = satisfied;
+            this.confirmedCount = confirmedCount;
+            this.ambiguousBuckets = ambiguousBuckets;
+            this.status = status;
+        }
+    }
+
+    /**
+     * 配置类
+     */
+    public static class Config {
+        public String dbPath;
+        public long healpixId;
+        public long timeBucketSize = 1; // 天为单位
+        public boolean asyncIndexing = true;
+        public int maxBackgroundCompactions = 4;
+        public long blockCacheSize = 2 * SizeUnit.GB;
+
+        // 时间桶参数
+        public double lambda = 0.6; // 代价函数中的权重参数
+        public double storeCost = 10.0; // 存储代价
+        public int maxBucketGap = 200; // 最大桶间隔（K参数）
+
+        public Config(String dbPath, long healpixId) {
+            this.dbPath = dbPath;
+            this.healpixId = healpixId;
+        }
+    }
+
+    /**
+     * 索引更新任务
+     */
+    private static class IndexUpdateTask {
+        public final long sourceId;
+        public final String band;
+        public final double time;
+        public final double mag;
+
+        public IndexUpdateTask(long sourceId, String band, double time, double mag) {
+            this.sourceId = sourceId;
+            this.band = band;
+            this.time = time;
+            this.mag = mag;
+        }
+    }
+
 }
