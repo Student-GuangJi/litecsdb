@@ -380,12 +380,65 @@ public class StorageNode {
             dbStatusList.add(dbStatus);
         }
         status.put("databases", dbStatusList);
+        status.put("boundary_alignment", getBoundaryAlignmentStats());
 
         return status;
     }
 
+    public Map<String, Object> getBoundaryAlignmentStats() {
+        long fragmentedFlushTotal = 0;
+        long lowerLevelAlignedFlushTotal = 0;
+        long lowerLevelBoundaryHits = 0;
+        long staticBoundaryHits = 0;
+        long dynamicBoundaryHits = 0;
+        int dbCountWithStats = 0;
+
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                Map<String, Object> dbStats = dbService.getHealpixStatistics();
+                fragmentedFlushTotal += asLong(dbStats.get("fragmented_flush_total"));
+                lowerLevelAlignedFlushTotal += asLong(dbStats.get("lower_level_aligned_flush_total"));
+                lowerLevelBoundaryHits += asLong(dbStats.get("last_flush_lower_level_boundary_hits"));
+                staticBoundaryHits += asLong(dbStats.get("last_flush_static_boundary_hits"));
+                dynamicBoundaryHits += asLong(dbStats.get("last_flush_dynamic_boundary_hits"));
+                dbCountWithStats++;
+            } catch (Exception e) {
+                // Ignore broken partition stats to keep aggregation robust.
+            }
+        }
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("node_id", nodeId);
+        result.put("partitions_with_stats", dbCountWithStats);
+        result.put("fragmented_flush_total", fragmentedFlushTotal);
+        result.put("lower_level_aligned_flush_total", lowerLevelAlignedFlushTotal);
+        result.put("lower_level_aligned_flush_ratio",
+                fragmentedFlushTotal > 0 ? (double) lowerLevelAlignedFlushTotal / fragmentedFlushTotal : 0.0);
+        result.put("last_flush_lower_level_boundary_hits_sum", lowerLevelBoundaryHits);
+        result.put("last_flush_static_boundary_hits_sum", staticBoundaryHits);
+        result.put("last_flush_dynamic_boundary_hits_sum", dynamicBoundaryHits);
+        return result;
+    }
+
+    private long asLong(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        if (value instanceof String) {
+            try {
+                return Long.parseLong((String) value);
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
     public void shutdown() {
         queryExecutor.shutdown();
+
+        forceFlushAll();
+
         for (RocksDBServer dbService : healpixDatabases.values()) {
             try {
                 dbService.close();
@@ -500,3 +553,4 @@ public class StorageNode {
         }
     }
 }
+

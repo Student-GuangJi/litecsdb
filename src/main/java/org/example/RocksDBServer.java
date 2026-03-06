@@ -36,6 +36,11 @@ public class RocksDBServer implements AutoCloseable {
     // 记录时间起点：2455197.5，儒略日 2455197.5，也就是UTC时间2010年1月1日 00:00:00。
     private final long initialDirSize;
 
+    // Boundary-aligned flush telemetry
+    private volatile BoundaryFlushTelemetry lastBoundaryFlushTelemetry = BoundaryFlushTelemetry.empty();
+    private final AtomicLong totalFragmentedFlushCount = new AtomicLong(0);
+    private final AtomicLong totalLowerLevelAlignedFlushCount = new AtomicLong(0);
+
     // ==========================================
     // 定制化应用层 MemTable 及控制阈值
     // ==========================================
@@ -55,7 +60,7 @@ public class RocksDBServer implements AutoCloseable {
     // 用于追踪所有后台正在执行的 Flush 任务（以便 forceFlush 时等待它们落盘）
     private final List<CompletableFuture<Void>> pendingFlushTasks = Collections.synchronizedList(new ArrayList<>());
 
-    private final long MEMTABLE_FLUSH_THRESHOLD = 64 * 1024 * 1024; // 64MB 触发刷写
+    private final long MEMTABLE_FLUSH_THRESHOLD = RocksDBGlobalResourceManager.MEMTABLE_FLUSH_THRESHOLD;
     private final long MIN_SST_FILE_SIZE = 2 * 1024 * 1024;         // 2MB 最小文件约束
 
     public RocksDBServer(Config config) throws RocksDBException {
@@ -66,16 +71,7 @@ public class RocksDBServer implements AutoCloseable {
 
         RocksDB.loadLibrary();
 
-        // 初始化统计
         this.statistics = new Statistics();
-
-        // 创建列族描述
-        List<ColumnFamilyDescriptor> cfDescriptors = Arrays.asList(
-                new ColumnFamilyDescriptor("default".getBytes()),
-                new ColumnFamilyDescriptor("lightcurve".getBytes()),
-                new ColumnFamilyDescriptor("metadata".getBytes()),
-                new ColumnFamilyDescriptor("time_buckets".getBytes())
-        );
 
         RocksDBGlobalResourceManager globalRes = RocksDBGlobalResourceManager.getInstance();
 
@@ -88,12 +84,28 @@ public class RocksDBServer implements AutoCloseable {
                 .setCreateMissingColumnFamilies(true)
                 .setEnv(globalRes.getEnv()) // 使用全局调度线程池
                 .setWriteBufferManager(globalRes.getWriteBufferManager()) // 使用全局写限制
+                .setMaxBackgroundJobs(16)
+                .setIncreaseParallelism(Math.max(8, Runtime.getRuntime().availableProcessors()))
+                .setBytesPerSync(4L * 1024 * 1024)
                 .setStatistics(statistics)) {
 
             // 列族选项
             try (final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
                     .setCompressionType(CompressionType.LZ4_COMPRESSION)
-                    .setTableFormatConfig(tableConfig)) {
+                    .setTableFormatConfig(tableConfig)
+                    .setWriteBufferSize(64L * 1024 * 1024)
+                    .setMaxWriteBufferNumber(8)
+                    .setMinWriteBufferNumberToMerge(2)
+                    .setLevel0FileNumCompactionTrigger(8)
+                    .setLevel0SlowdownWritesTrigger(32)
+                    .setLevel0StopWritesTrigger(48)) {
+
+                List<ColumnFamilyDescriptor> cfDescriptors = Arrays.asList(
+                        new ColumnFamilyDescriptor("default".getBytes(), cfOptions),
+                        new ColumnFamilyDescriptor("lightcurve".getBytes(), cfOptions),
+                        new ColumnFamilyDescriptor("metadata".getBytes(), cfOptions),
+                        new ColumnFamilyDescriptor("time_buckets".getBytes(), cfOptions)
+                );
 
                 List<ColumnFamilyHandle> handles = new ArrayList<>();
                 this.db = RocksDB.open(dbOptions, config.dbPath, cfDescriptors, handles);
@@ -133,6 +145,11 @@ public class RocksDBServer implements AutoCloseable {
         writeCount.addAndGet(points.size());
         updateStarsMetadataBatch(points);
 
+        if (config.enableOnlineTimeBucketUpdate && points.size() >= config.onlineTimeBucketMinBatchPoints) {
+            // 在线更新只在显式开启时执行，避免默认写入路径被索引构建拖慢。
+            updateTimeBucketsForBatch(points);
+        }
+
         if (activeMemTableSize.addAndGet(batchLogicalSize) >= MEMTABLE_FLUSH_THRESHOLD) {
             triggerAsyncFlush();
         }
@@ -156,10 +173,20 @@ public class RocksDBServer implements AutoCloseable {
 
         // 2. 将摘下来的满盆扔给全局后台线程池去慢慢写 SST
         CompletableFuture<Void> flushTask = CompletableFuture.runAsync(() -> {
+            RocksDBGlobalResourceManager manager = RocksDBGlobalResourceManager.getInstance();
+            boolean acquired = false;
             try {
+                manager.getFlushConcurrencyLimiter().acquire();
+                acquired = true;
                 doFragmentedFlush(memTableToFlush);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } catch (RocksDBException e) {
                 System.err.println("异步碎片化 Flush 发生错误: " + e.getMessage());
+            } finally {
+                if (acquired) {
+                    manager.getFlushConcurrencyLimiter().release();
+                }
             }
         }, RocksDBGlobalResourceManager.getInstance().getCustomAsyncFlushPool());
 
@@ -176,7 +203,23 @@ public class RocksDBServer implements AutoCloseable {
         SstFileWriter sstFileWriter = null;
         String currentSstPath = null;
         long currentSstSize = 0;
-        long lastSourceId = -1;
+        long lastBoundary = -1;
+
+        final long boundarySpan = Math.max(1L, config.flushSourceBoundarySpan);
+        final int maxFragments = Math.max(1, config.maxFlushFragments);
+        final NavigableSet<Long> lowerLevelBoundarySet = buildLowerLevelBoundarySet(boundarySpan);
+        final boolean hasLowerLevelBoundarySet = !lowerLevelBoundarySet.isEmpty();
+
+        final int targetFragments = config.enableDynamicFlushBoundaries
+                ? Math.min(maxFragments, Math.max(1, (int) Math.ceil((double) memTable.size() / config.dynamicBoundaryEntriesPerFragment)))
+                : maxFragments;
+        final int entriesPerDynamicBoundary = Math.max(1, memTable.size() / targetFragments);
+
+        int seenEntries = 0;
+        int emittedFragments = 0;
+        int lowerLevelBoundaryHitCount = 0;
+        int staticBoundaryHitCount = 0;
+        int dynamicBoundaryHitCount = 0;
 
         try (EnvOptions envOptions = new EnvOptions();
              Options options = new Options().setCompressionType(CompressionType.LZ4_COMPRESSION)) {
@@ -185,11 +228,32 @@ public class RocksDBServer implements AutoCloseable {
                 byte[] key = entry.getKey();
                 byte[] value = entry.getValue();
                 long currentSourceId = extractSourceId(key);
+                long currentBoundary = currentSourceId / boundarySpan;
 
-                if (sstFileWriter != null && currentSstSize >= MIN_SST_FILE_SIZE && currentSourceId != lastSourceId) {
+                boolean lowerLevelBoundaryHit = hasLowerLevelBoundarySet
+                        && currentBoundary != lastBoundary
+                        && lowerLevelBoundarySet.contains(currentBoundary);
+                boolean staticBoundaryHit = config.enableStaticBoundaryFallback
+                        && !hasLowerLevelBoundarySet
+                        && currentBoundary != lastBoundary;
+                boolean dynamicBoundaryHit = config.enableDynamicFlushBoundaries
+                        && seenEntries > 0
+                        && seenEntries % entriesPerDynamicBoundary == 0;
+
+                if (lowerLevelBoundaryHit) lowerLevelBoundaryHitCount++;
+                if (staticBoundaryHit) staticBoundaryHitCount++;
+                if (dynamicBoundaryHit) dynamicBoundaryHitCount++;
+
+                boolean canRotate = sstFileWriter != null
+                        && currentSstSize >= MIN_SST_FILE_SIZE
+                        && (lowerLevelBoundaryHit || staticBoundaryHit || dynamicBoundaryHit)
+                        && emittedFragments < maxFragments - 1;
+
+                if (canRotate) {
                     sstFileWriter.finish();
                     sstFileWriter.close();
                     generatedSstFiles.add(currentSstPath);
+                    emittedFragments++;
                     sstFileWriter = null;
                 }
 
@@ -198,12 +262,12 @@ public class RocksDBServer implements AutoCloseable {
                     sstFileWriter = new SstFileWriter(envOptions, options);
                     sstFileWriter.open(currentSstPath);
                     currentSstSize = 0;
-                    lastSourceId = currentSourceId;
                 }
 
                 sstFileWriter.put(key, value);
                 currentSstSize += (key.length + value.length);
-                lastSourceId = currentSourceId;
+                lastBoundary = currentBoundary;
+                seenEntries++;
             }
 
             if (sstFileWriter != null) {
@@ -215,11 +279,57 @@ public class RocksDBServer implements AutoCloseable {
             if (!generatedSstFiles.isEmpty()) {
                 try (IngestExternalFileOptions ingestOpts = new IngestExternalFileOptions()) {
                     ingestOpts.setMoveFiles(true);
-                    // 使用 Java JNI 正确的方法名调用
                     db.ingestExternalFile(lightcurveHandle, generatedSstFiles, ingestOpts);
                 }
             }
         }
+
+        totalFragmentedFlushCount.incrementAndGet();
+        if (hasLowerLevelBoundarySet) {
+            totalLowerLevelAlignedFlushCount.incrementAndGet();
+        }
+        lastBoundaryFlushTelemetry = new BoundaryFlushTelemetry(
+                System.currentTimeMillis(),
+                seenEntries,
+                generatedSstFiles.size(),
+                hasLowerLevelBoundarySet,
+                lowerLevelBoundarySet.size(),
+                lowerLevelBoundaryHitCount,
+                staticBoundaryHitCount,
+                dynamicBoundaryHitCount
+        );
+    }
+
+    private NavigableSet<Long> buildLowerLevelBoundarySet(long boundarySpan) {
+        NavigableSet<Long> boundarySet = new TreeSet<>();
+        if (!config.enableLowerLevelSstBoundaryAlignment) {
+            return boundarySet;
+        }
+
+        byte[] lightcurveCf = "lightcurve".getBytes(StandardCharsets.UTF_8);
+        try {
+            for (LiveFileMetaData fileMeta : db.getLiveFilesMetaData()) {
+                if (fileMeta.level() <= 0) {
+                    continue;
+                }
+                if (!Arrays.equals(lightcurveCf, fileMeta.columnFamilyName())) {
+                    continue;
+                }
+
+                long smallestSourceId = extractSourceId(fileMeta.smallestKey());
+                long largestSourceId = extractSourceId(fileMeta.largestKey());
+                long leftBoundary = smallestSourceId / boundarySpan;
+                long rightBoundaryExclusive = (largestSourceId / boundarySpan) + 1;
+
+                boundarySet.add(leftBoundary);
+                boundarySet.add(rightBoundaryExclusive);
+            }
+        } catch (Exception e) {
+            System.err.println("提取下层SST边界失败，回退到静态边界: " + e.getMessage());
+            boundarySet.clear();
+        }
+
+        return boundarySet;
     }
     /**
      * 高效从前缀 Key 中提取 sourceId (避免 new String 产生 GC 开销)
@@ -616,23 +726,23 @@ public class RocksDBServer implements AutoCloseable {
      * 获取所有天体元数据
      */
     public List<StarMetadata> getAllStarsMetadata() throws RocksDBException {
-        List<StarMetadata> stars = new ArrayList<>();
+        Map<Long, StarMetadata> merged = new LinkedHashMap<>();
 
+        // 先加载已持久化元数据
         try (final RocksIterator iterator = db.newIterator(metadataHandle)) {
             for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
                 byte[] key = iterator.key();
-                byte[] value = iterator.value();
-
-                // 只处理天体元数据（以"star_"开头的key）
                 String keyStr = new String(key);
                 if (keyStr.startsWith("star_")) {
-                    StarMetadata metadata = deserializeStarMetadata(value);
-                    stars.add(metadata);
+                    StarMetadata metadata = deserializeStarMetadata(iterator.value());
+                    merged.put(metadata.sourceId, metadata);
                 }
             }
         }
 
-        return stars;
+        // 再覆盖未落盘缓存，保证写后可见
+        merged.putAll(metadataCache);
+        return new ArrayList<>(merged.values());
     }
 
     /**
@@ -696,6 +806,18 @@ public class RocksDBServer implements AutoCloseable {
         long startQueryTime = System.nanoTime();
 
         List<TimeBucket> buckets = getTimeBuckets(sourceId, band);
+        if (buckets.isEmpty()) {
+            int exactCount = 0;
+            for (LightCurvePoint point : queryByTimeRangeAndBand(sourceId, band, startTime, endTime)) {
+                if (point.mag <= magThreshold) {
+                    exactCount++;
+                }
+            }
+            if (exactCount >= minCount) {
+                return new TimeBucketQueryResult(true, exactCount, null, "CONFIRMED");
+            }
+            return new TimeBucketQueryResult(false, exactCount, null, "PRUNED");
+        }
 
         // ✅ 统计信息
         int totalBuckets = buckets.size();
@@ -871,11 +993,29 @@ public class RocksDBServer implements AutoCloseable {
         // 数据库属性
         stats.put("approximate_size_mb", getApproximateSize() / (1024 * 1024));
 
+        BoundaryFlushTelemetry flushTelemetry = lastBoundaryFlushTelemetry;
+        stats.put("fragmented_flush_total", totalFragmentedFlushCount.get());
+        stats.put("lower_level_aligned_flush_total", totalLowerLevelAlignedFlushCount.get());
+        stats.put("last_flush_time_ms", flushTelemetry.flushTimeMs);
+        stats.put("last_flush_entries", flushTelemetry.entries);
+        stats.put("last_flush_generated_sst", flushTelemetry.generatedSstFiles);
+        stats.put("last_flush_used_lower_level_boundaries", flushTelemetry.usedLowerLevelBoundaries);
+        stats.put("last_flush_lower_level_boundary_count", flushTelemetry.lowerLevelBoundaryCount);
+        stats.put("last_flush_lower_level_boundary_hits", flushTelemetry.lowerLevelBoundaryHits);
+        stats.put("last_flush_static_boundary_hits", flushTelemetry.staticBoundaryHits);
+        stats.put("last_flush_dynamic_boundary_hits", flushTelemetry.dynamicBoundaryHits);
+
         return stats;
     }
 
     @Override
     public void close() {
+        try {
+            forceFlush();
+        } catch (Exception e) {
+            System.err.println("关闭前最终落盘失败: " + e.getMessage());
+        }
+
         if (defaultHandle != null) defaultHandle.close();
         if (lightcurveHandle != null) lightcurveHandle.close();
         if (metadataHandle != null) metadataHandle.close();
@@ -1058,24 +1198,32 @@ public class RocksDBServer implements AutoCloseable {
         CompletableFuture<Void> allTasks = CompletableFuture.allOf(
                 pendingFlushTasks.toArray(new CompletableFuture[0]));
         try {
-            allTasks.join();
-        } catch (Exception e) {}
+            allTasks.get(config.flushAwaitTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new RocksDBException("等待后台Flush超时: " + config.flushAwaitTimeoutMs + "ms");
+        } catch (Exception e) {
+            throw new RocksDBException("等待后台Flush失败: " + e.getMessage());
+        } finally {
+            pendingFlushTasks.removeIf(CompletableFuture::isDone);
+        }
 
         // 3. 内存聚合的元数据落盘
         if (!metadataCache.isEmpty()) {
-            try (WriteBatch batch = new WriteBatch()) {
+            try (WriteBatch batch = new WriteBatch();
+                 WriteOptions writeOptions = new WriteOptions().setDisableWAL(true)) {
                 for (StarMetadata meta : metadataCache.values()) {
                     batch.put(metadataHandle, buildStarMetadataKey(meta.sourceId), serializeStarMetadata(meta));
                 }
-                db.write(new WriteOptions().setDisableWAL(true), batch);
+                db.write(writeOptions, batch);
             }
             metadataCache.clear();
         }
 
         // 4. 原生刷盘与合并（清除由于元数据写入产生的碎片）
-        FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true);
-        db.flush(flushOptions, defaultHandle);
-        db.flush(flushOptions, metadataHandle);
+        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+            db.flush(flushOptions, defaultHandle);
+            db.flush(flushOptions, metadataHandle);
+        }
 
         db.compactRange(defaultHandle);
         db.compactRange(lightcurveHandle); // 对 Ingest 进来的文件做一次物理合并对齐
@@ -1211,6 +1359,15 @@ public class RocksDBServer implements AutoCloseable {
         public double lambda = 0.6; // 代价函数中的权重参数
         public double storeCost = 10.0; // 存储代价
         public int maxBucketGap = 200; // 最大桶间隔（K参数）
+        public long flushSourceBoundarySpan = 50_000L; // 静态边界跨度（按sourceId区间）
+        public int maxFlushFragments = 64; // 单次Flush最多切分文件数
+        public boolean enableDynamicFlushBoundaries = true; // 启用动态边界切分
+        public int dynamicBoundaryEntriesPerFragment = 200_000; // 动态边界的目标条目粒度
+        public boolean enableLowerLevelSstBoundaryAlignment = true; // 从下层SST元数据提取真实边界
+        public boolean enableStaticBoundaryFallback = true; // 下层边界不可用时回退静态边界
+        public boolean enableOnlineTimeBucketUpdate = false; // 默认关闭在线索引构建
+        public int onlineTimeBucketMinBatchPoints = 5_000;
+        public long flushAwaitTimeoutMs = 120_000L;
 
         public Config(String dbPath, long healpixId) {
             this.dbPath = dbPath;
@@ -1232,6 +1389,39 @@ public class RocksDBServer implements AutoCloseable {
             this.band = band;
             this.time = time;
             this.mag = mag;
+        }
+    }
+
+    private static class BoundaryFlushTelemetry {
+        final long flushTimeMs;
+        final int entries;
+        final int generatedSstFiles;
+        final boolean usedLowerLevelBoundaries;
+        final int lowerLevelBoundaryCount;
+        final int lowerLevelBoundaryHits;
+        final int staticBoundaryHits;
+        final int dynamicBoundaryHits;
+
+        BoundaryFlushTelemetry(long flushTimeMs,
+                               int entries,
+                               int generatedSstFiles,
+                               boolean usedLowerLevelBoundaries,
+                               int lowerLevelBoundaryCount,
+                               int lowerLevelBoundaryHits,
+                               int staticBoundaryHits,
+                               int dynamicBoundaryHits) {
+            this.flushTimeMs = flushTimeMs;
+            this.entries = entries;
+            this.generatedSstFiles = generatedSstFiles;
+            this.usedLowerLevelBoundaries = usedLowerLevelBoundaries;
+            this.lowerLevelBoundaryCount = lowerLevelBoundaryCount;
+            this.lowerLevelBoundaryHits = lowerLevelBoundaryHits;
+            this.staticBoundaryHits = staticBoundaryHits;
+            this.dynamicBoundaryHits = dynamicBoundaryHits;
+        }
+
+        static BoundaryFlushTelemetry empty() {
+            return new BoundaryFlushTelemetry(0L, 0, 0, false, 0, 0, 0, 0);
         }
     }
 
