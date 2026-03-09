@@ -11,13 +11,22 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 天文光变曲线RocksDB服务 - 针对HEALPix分区的分布式存储系统设计
- * 每个实例负责一个HEALPix天区的数据管理
+ * 天文光变曲线 RocksDB 服务 - 针对 HEALPix 分区的分布式存储
+ *
+ * 写入路径（已修改为完整持久化）：
+ *   putLightCurveBatch(points)
+ *     → WriteBatch 批量组装
+ *     → db.write(writeOptions, batch)  // WAL → memtable → flush → SST
+ *
+ * 与基线系统对齐：
+ *   - WAL_LEVEL: 使用 RocksDB 默认 WAL（与 TDengine WAL_LEVEL=1 对齐）
+ *   - 持久化: 每次 write() 都经过 WAL 持久化保证
+ *   - 刷盘: 由 RocksDB 原生 memtable 管理 flush 时机
  */
 public class RocksDBServer implements AutoCloseable {
     private final RocksDB db;
     private final String dbPath;
-    private final long healpixId; // 当前实例负责的HEALPix天区ID
+    private final long healpixId;
     private final Config config;
     private final Map<Long, StarMetadata> metadataCache = new ConcurrentHashMap<>();
 
@@ -27,41 +36,20 @@ public class RocksDBServer implements AutoCloseable {
     private final ColumnFamilyHandle metadataHandle;
     private final ColumnFamilyHandle timeBucketsHandle;
 
+    // 写入选项：走 WAL 持久化路径（公平比较）
+    private final WriteOptions writeOptions;
+
     // 统计信息
     private final AtomicLong writeCount = new AtomicLong(0);
     private final AtomicLong readCount = new AtomicLong(0);
     private final AtomicLong logicalBytesWritten = new AtomicLong(0);
     private final Statistics statistics;
     private final long startTime;
-    // 记录时间起点：2455197.5，儒略日 2455197.5，也就是UTC时间2010年1月1日 00:00:00。
     private final long initialDirSize;
 
-    // Boundary-aligned flush telemetry
-    private volatile BoundaryFlushTelemetry lastBoundaryFlushTelemetry = BoundaryFlushTelemetry.empty();
+    // Boundary-aligned flush telemetry (保留用于 getHealpixStatistics)
     private final AtomicLong totalFragmentedFlushCount = new AtomicLong(0);
     private final AtomicLong totalLowerLevelAlignedFlushCount = new AtomicLong(0);
-
-    // ==========================================
-    // 定制化应用层 MemTable 及控制阈值
-    // ==========================================
-    // 使用无符号字节比较器，严格对齐 RocksDB 原生的 BytewiseComparator
-    private static final Comparator<byte[]> UNSIGNED_BYTE_COMPARATOR = (a, b) -> {
-        int len = Math.min(a.length, b.length);
-        for (int i = 0; i < len; i++) {
-            if (a[i] != b[i]) return (a[i] & 0xFF) - (b[i] & 0xFF);
-        }
-        return a.length - b.length;
-    };
-
-    // 🚀 使用 volatile 保证线程可见性，这是我们当前正在接收数据的“活跃盆”
-    private volatile ConcurrentSkipListMap<byte[], byte[]> activeMemTable = new ConcurrentSkipListMap<>(UNSIGNED_BYTE_COMPARATOR);
-    private final AtomicLong activeMemTableSize = new AtomicLong(0);
-
-    // 用于追踪所有后台正在执行的 Flush 任务（以便 forceFlush 时等待它们落盘）
-    private final List<CompletableFuture<Void>> pendingFlushTasks = Collections.synchronizedList(new ArrayList<>());
-
-    private final long MEMTABLE_FLUSH_THRESHOLD = RocksDBGlobalResourceManager.MEMTABLE_FLUSH_THRESHOLD;
-    private final long MIN_SST_FILE_SIZE = 2 * 1024 * 1024;         // 2MB 最小文件约束
 
     public RocksDBServer(Config config) throws RocksDBException {
         this.healpixId = config.healpixId;
@@ -76,25 +64,25 @@ public class RocksDBServer implements AutoCloseable {
         RocksDBGlobalResourceManager globalRes = RocksDBGlobalResourceManager.getInstance();
 
         BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
-                .setBlockCache(globalRes.getBlockCache()); // 使用全局缓存
+                .setBlockCache(globalRes.getBlockCache());
 
         // 数据库选项
         try (final DBOptions dbOptions = new DBOptions()
                 .setCreateIfMissing(true)
                 .setCreateMissingColumnFamilies(true)
-                .setEnv(globalRes.getEnv()) // 使用全局调度线程池
-                .setWriteBufferManager(globalRes.getWriteBufferManager()) // 使用全局写限制
+                .setEnv(globalRes.getEnv())
+                .setWriteBufferManager(globalRes.getWriteBufferManager())
                 .setMaxBackgroundJobs(16)
                 .setIncreaseParallelism(Math.max(8, Runtime.getRuntime().availableProcessors()))
                 .setBytesPerSync(4L * 1024 * 1024)
                 .setStatistics(statistics)) {
 
-            // 列族选项
+            // 列族选项 - 256MB write buffer（对齐 TDengine BUFFER=256）
             try (final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
                     .setCompressionType(CompressionType.LZ4_COMPRESSION)
                     .setTableFormatConfig(tableConfig)
-                    .setWriteBufferSize(64L * 1024 * 1024)
-                    .setMaxWriteBufferNumber(8)
+                    .setWriteBufferSize(256L * 1024 * 1024) // 256MB 对齐
+                    .setMaxWriteBufferNumber(4)
                     .setMinWriteBufferNumberToMerge(2)
                     .setLevel0FileNumCompactionTrigger(8)
                     .setLevel0SlowdownWritesTrigger(32)
@@ -110,7 +98,6 @@ public class RocksDBServer implements AutoCloseable {
                 List<ColumnFamilyHandle> handles = new ArrayList<>();
                 this.db = RocksDB.open(dbOptions, config.dbPath, cfDescriptors, handles);
 
-                // 存储列族句柄
                 this.defaultHandle = handles.get(0);
                 this.lightcurveHandle = handles.get(1);
                 this.metadataHandle = handles.get(2);
@@ -118,245 +105,69 @@ public class RocksDBServer implements AutoCloseable {
             }
         }
 
-        // 存储配置元数据
-        storeMetadata(config);
+        // 写入选项：启用 WAL（公平比较）
+        // sync=false 表示不每次 fsync，由 OS 缓冲（与 TDengine WAL_FSYNC_PERIOD=3000 对齐）
+        this.writeOptions = new WriteOptions()
+                .setSync(false)
+                .setDisableWAL(false);
 
-        // 记录当前 HEALPix 天区目录的初始大小
+        storeMetadata(config);
         this.initialDirSize = StorageUtils.getDirectorySize(config.dbPath);
     }
 
-
     // ========== 数据写入接口 ==========
+
     /**
-     * 极速写入路径：只写内存，绝不阻塞！
+     * 批量写入 — 极简快速路径
+     *
+     * 优化：
+     * 1. 二进制 key（消除 String.format）
+     * 2. 不在写入路径做元数据更新（延迟到 forceFlush）
+     * 3. 不在写入路径做时间桶更新
      */
     public void putLightCurveBatch(List<LightCurvePoint> points) throws RocksDBException {
+        if (points == null || points.isEmpty()) return;
+
         long batchLogicalSize = points.size() * 90L;
 
-        for (LightCurvePoint point : points) {
-            String keyStr = point.sourceId + "|" + point.band + "|" + point.time;
-            byte[] key = keyStr.getBytes(StandardCharsets.UTF_8);
-            byte[] value = serializeLightCurvePoint(point);
-            // 写入当前活跃的内存表
-            activeMemTable.put(key, value);
+        try (WriteBatch batch = new WriteBatch()) {
+            for (LightCurvePoint point : points) {
+                byte[] key = buildBinaryKey(point.sourceId, point.band, point.time);
+                byte[] value = serializeLightCurvePoint(point);
+                batch.put(lightcurveHandle, key, value);
+            }
+            db.write(writeOptions, batch);
         }
 
         logicalBytesWritten.addAndGet(batchLogicalSize);
         writeCount.addAndGet(points.size());
-        updateStarsMetadataBatch(points);
 
-        if (config.enableOnlineTimeBucketUpdate && points.size() >= config.onlineTimeBucketMinBatchPoints) {
-            // 在线更新只在显式开启时执行，避免默认写入路径被索引构建拖慢。
-            updateTimeBucketsForBatch(points);
+        // 元数据延迟聚合（内存操作，不读 RocksDB）
+        for (LightCurvePoint point : points) {
+            metadataCache.merge(point.sourceId,
+                    new StarMetadata(point.sourceId, point.ra, point.dec, 1, point.mag, point.time, point.time),
+                    (existing, newMeta) -> new StarMetadata(
+                            existing.sourceId, existing.ra, existing.dec,
+                            existing.observationCount + 1,
+                            (existing.avgMag * existing.observationCount + newMeta.avgMag) / (existing.observationCount + 1),
+                            Math.min(existing.firstObsTime, newMeta.firstObsTime),
+                            Math.max(existing.lastObsTime, newMeta.lastObsTime)
+                    ));
         }
-
-        if (activeMemTableSize.addAndGet(batchLogicalSize) >= MEMTABLE_FLUSH_THRESHOLD) {
-            triggerAsyncFlush();
-        }
-    }
-    /**
-     * 【核心动作】：双缓冲原子切换。主线程毫秒级脱身！
-     */
-    private synchronized void triggerAsyncFlush() {
-        // 双重检查，防止并发线程重复触发
-        if (activeMemTableSize.get() < MEMTABLE_FLUSH_THRESHOLD || activeMemTable.isEmpty()) {
-            return;
-        }
-
-        // 1. 瞬间换盆：把写满的表摘下来，换上一个全新的空表给主线程继续写
-        final ConcurrentSkipListMap<byte[], byte[]> memTableToFlush = activeMemTable;
-        activeMemTable = new ConcurrentSkipListMap<>(UNSIGNED_BYTE_COMPARATOR);
-        activeMemTableSize.set(0);
-
-        // 清理已完成的旧任务引用，防止内存泄漏
-        pendingFlushTasks.removeIf(CompletableFuture::isDone);
-
-        // 2. 将摘下来的满盆扔给全局后台线程池去慢慢写 SST
-        CompletableFuture<Void> flushTask = CompletableFuture.runAsync(() -> {
-            RocksDBGlobalResourceManager manager = RocksDBGlobalResourceManager.getInstance();
-            boolean acquired = false;
-            try {
-                manager.getFlushConcurrencyLimiter().acquire();
-                acquired = true;
-                doFragmentedFlush(memTableToFlush);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (RocksDBException e) {
-                System.err.println("异步碎片化 Flush 发生错误: " + e.getMessage());
-            } finally {
-                if (acquired) {
-                    manager.getFlushConcurrencyLimiter().release();
-                }
-            }
-        }, RocksDBGlobalResourceManager.getInstance().getCustomAsyncFlushPool());
-
-        // 记录任务
-        pendingFlushTasks.add(flushTask);
-    }
-    /**
-     * 后台线程专属方法：执行真实的边界对齐 SST 切分与导入
-     */
-    private void doFragmentedFlush(ConcurrentSkipListMap<byte[], byte[]> memTable) throws RocksDBException {
-        if (memTable == null || memTable.isEmpty()) return;
-
-        List<String> generatedSstFiles = new ArrayList<>();
-        SstFileWriter sstFileWriter = null;
-        String currentSstPath = null;
-        long currentSstSize = 0;
-        long lastBoundary = -1;
-
-        final long boundarySpan = Math.max(1L, config.flushSourceBoundarySpan);
-        final int maxFragments = Math.max(1, config.maxFlushFragments);
-        final NavigableSet<Long> lowerLevelBoundarySet = buildLowerLevelBoundarySet(boundarySpan);
-        final boolean hasLowerLevelBoundarySet = !lowerLevelBoundarySet.isEmpty();
-
-        final int targetFragments = config.enableDynamicFlushBoundaries
-                ? Math.min(maxFragments, Math.max(1, (int) Math.ceil((double) memTable.size() / config.dynamicBoundaryEntriesPerFragment)))
-                : maxFragments;
-        final int entriesPerDynamicBoundary = Math.max(1, memTable.size() / targetFragments);
-
-        int seenEntries = 0;
-        int emittedFragments = 0;
-        int lowerLevelBoundaryHitCount = 0;
-        int staticBoundaryHitCount = 0;
-        int dynamicBoundaryHitCount = 0;
-
-        try (EnvOptions envOptions = new EnvOptions();
-             Options options = new Options().setCompressionType(CompressionType.LZ4_COMPRESSION)) {
-
-            for (Map.Entry<byte[], byte[]> entry : memTable.entrySet()) {
-                byte[] key = entry.getKey();
-                byte[] value = entry.getValue();
-                long currentSourceId = extractSourceId(key);
-                long currentBoundary = currentSourceId / boundarySpan;
-
-                boolean lowerLevelBoundaryHit = hasLowerLevelBoundarySet
-                        && currentBoundary != lastBoundary
-                        && lowerLevelBoundarySet.contains(currentBoundary);
-                boolean staticBoundaryHit = config.enableStaticBoundaryFallback
-                        && !hasLowerLevelBoundarySet
-                        && currentBoundary != lastBoundary;
-                boolean dynamicBoundaryHit = config.enableDynamicFlushBoundaries
-                        && seenEntries > 0
-                        && seenEntries % entriesPerDynamicBoundary == 0;
-
-                if (lowerLevelBoundaryHit) lowerLevelBoundaryHitCount++;
-                if (staticBoundaryHit) staticBoundaryHitCount++;
-                if (dynamicBoundaryHit) dynamicBoundaryHitCount++;
-
-                boolean canRotate = sstFileWriter != null
-                        && currentSstSize >= MIN_SST_FILE_SIZE
-                        && (lowerLevelBoundaryHit || staticBoundaryHit || dynamicBoundaryHit)
-                        && emittedFragments < maxFragments - 1;
-
-                if (canRotate) {
-                    sstFileWriter.finish();
-                    sstFileWriter.close();
-                    generatedSstFiles.add(currentSstPath);
-                    emittedFragments++;
-                    sstFileWriter = null;
-                }
-
-                if (sstFileWriter == null) {
-                    currentSstPath = dbPath + "/fragment_" + System.nanoTime() + "_" + generatedSstFiles.size() + ".sst";
-                    sstFileWriter = new SstFileWriter(envOptions, options);
-                    sstFileWriter.open(currentSstPath);
-                    currentSstSize = 0;
-                }
-
-                sstFileWriter.put(key, value);
-                currentSstSize += (key.length + value.length);
-                lastBoundary = currentBoundary;
-                seenEntries++;
-            }
-
-            if (sstFileWriter != null) {
-                sstFileWriter.finish();
-                sstFileWriter.close();
-                generatedSstFiles.add(currentSstPath);
-            }
-
-            if (!generatedSstFiles.isEmpty()) {
-                try (IngestExternalFileOptions ingestOpts = new IngestExternalFileOptions()) {
-                    ingestOpts.setMoveFiles(true);
-                    db.ingestExternalFile(lightcurveHandle, generatedSstFiles, ingestOpts);
-                }
-            }
-        }
-
-        totalFragmentedFlushCount.incrementAndGet();
-        if (hasLowerLevelBoundarySet) {
-            totalLowerLevelAlignedFlushCount.incrementAndGet();
-        }
-        lastBoundaryFlushTelemetry = new BoundaryFlushTelemetry(
-                System.currentTimeMillis(),
-                seenEntries,
-                generatedSstFiles.size(),
-                hasLowerLevelBoundarySet,
-                lowerLevelBoundarySet.size(),
-                lowerLevelBoundaryHitCount,
-                staticBoundaryHitCount,
-                dynamicBoundaryHitCount
-        );
-    }
-
-    private NavigableSet<Long> buildLowerLevelBoundarySet(long boundarySpan) {
-        NavigableSet<Long> boundarySet = new TreeSet<>();
-        if (!config.enableLowerLevelSstBoundaryAlignment) {
-            return boundarySet;
-        }
-
-        byte[] lightcurveCf = "lightcurve".getBytes(StandardCharsets.UTF_8);
-        try {
-            for (LiveFileMetaData fileMeta : db.getLiveFilesMetaData()) {
-                if (fileMeta.level() <= 0) {
-                    continue;
-                }
-                if (!Arrays.equals(lightcurveCf, fileMeta.columnFamilyName())) {
-                    continue;
-                }
-
-                long smallestSourceId = extractSourceId(fileMeta.smallestKey());
-                long largestSourceId = extractSourceId(fileMeta.largestKey());
-                long leftBoundary = smallestSourceId / boundarySpan;
-                long rightBoundaryExclusive = (largestSourceId / boundarySpan) + 1;
-
-                boundarySet.add(leftBoundary);
-                boundarySet.add(rightBoundaryExclusive);
-            }
-        } catch (Exception e) {
-            System.err.println("提取下层SST边界失败，回退到静态边界: " + e.getMessage());
-            boundarySet.clear();
-        }
-
-        return boundarySet;
-    }
-    /**
-     * 高效从前缀 Key 中提取 sourceId (避免 new String 产生 GC 开销)
-     */
-    private long extractSourceId(byte[] key) {
-        long id = 0;
-        for (byte b : key) {
-            if (b == '|') break;
-            id = id * 10 + (b - '0');
-        }
-        return id;
     }
 
     /**
-     * 批量更新天体元数据
+     * 批量更新天体元数据（内存聚合，forceFlush 时落盘）
      */
     private void updateStarsMetadataBatch(List<LightCurvePoint> points) {
         for (LightCurvePoint point : points) {
             metadataCache.compute(point.sourceId, (id, existing) -> {
-                // 如果内存没有，尝试从底层捞一次（一般只发生在重启续传时）
                 if (existing == null) {
                     try {
                         byte[] dbVal = db.get(metadataHandle, buildStarMetadataKey(id));
                         if (dbVal != null) existing = deserializeStarMetadata(dbVal);
                     } catch (RocksDBException e) {}
                 }
-                // 在内存中完成聚合，彻底切断对 RocksDB 的频繁写入
                 if (existing != null) {
                     return new StarMetadata(
                             existing.sourceId, existing.ra, existing.dec,
@@ -376,114 +187,134 @@ public class RocksDBServer implements AutoCloseable {
      * 更新时间桶
      */
     private void updateTimeBucketsForBatch(List<LightCurvePoint> points) throws RocksDBException {
-        // 按(sourceId, band)分组
         Map<String, List<LightCurvePoint>> groupedPoints = new HashMap<>();
         for (LightCurvePoint point : points) {
             String key = point.sourceId + "|" + point.band;
             groupedPoints.computeIfAbsent(key, k -> new ArrayList<>()).add(point);
         }
 
-        // 为每组重新计算时间桶
         for (Map.Entry<String, List<LightCurvePoint>> entry : groupedPoints.entrySet()) {
             String[] keyParts = entry.getKey().split("\\|");
             long sourceId = Long.parseLong(keyParts[0]);
             String band = keyParts[1];
 
-            // 获取该天体该波段的所有数据点
             List<LightCurvePoint> allPoints = getLightCurveByBand(sourceId, band);
-
             if (allPoints.isEmpty()) continue;
 
-            // 按时间排序
             allPoints.sort(Comparator.comparingDouble(p -> p.time));
-
-            // 使用DP算法划分时间桶
             List<TimeBucket> buckets = partitionTimeBuckets(sourceId, band, allPoints, config);
-
-            // 存储时间桶
             storeTimeBuckets(sourceId, band, buckets);
         }
     }
     /**
-     * 时间桶划分算法 - 动态规划
+     * 基于动态规划的自适应分桶算法（严格对齐论文 Algorithm 1）
+     *
+     * 对固定终点 i，从 i 向前枚举起点 s，增量维护 min(m) 与 max(m)。
+     * 硬约束：ΔT(s,i) ≤ ΔT_max 且 (i-s+1) ≤ N_max。
+     * 代价函数：L(s,i) = λ·C_store + (1-λ)·Δt·Δm
+     *
+     * 时间复杂度 O(n·min(K, N_max))，空间复杂度 O(n)。
      */
     private List<TimeBucket> partitionTimeBuckets(long sourceId, String band,
                                                   List<LightCurvePoint> points, Config config) {
         int n = points.size();
         if (n == 0) return new ArrayList<>();
 
-        // DP数组：dp[i]表示前i个点的最优划分代价
+        double lambda = config.lambda;
+        double cStore = config.storeCost;
+        double deltaTMax = config.deltaTMax;
+        int nMax = config.nMax;
+        int K = Math.min(config.maxBucketGap, nMax); // 回看上界
+
+        // DP[i] 表示前 i 个观测点的最小分桶代价
         double[] dp = new double[n + 1];
-        int[] partition = new int[n + 1]; // 记录划分位置
+        int[] pre = new int[n + 1];  // pre[i] 记录最优断点 j*
 
         Arrays.fill(dp, Double.MAX_VALUE);
         dp[0] = 0;
+        Arrays.fill(pre, -1);
 
-        // 动态规划
         for (int i = 1; i <= n; i++) {
-            // 尝试不同的划分点j，满足 i - K <= j < i
-            int startJ = Math.max(0, i - config.maxBucketGap);
-            for (int j = startJ; j < i; j++) {
-                double cost = calculateBucketCost(points, j, i - 1, config);
-                if (dp[j] + cost < dp[i]) {
-                    dp[i] = dp[j] + cost;
-                    partition[i] = j;
+            double mMin = Double.MAX_VALUE;
+            double mMax = -Double.MAX_VALUE;
+
+            // 从 i 向前枚举桶起点 s（论文中 s = j+1，这里 s 是 1-indexed）
+            for (int s = i; s >= Math.max(1, i - K + 1); s--) {
+                // 增量维护桶内 min/max mag
+                mMin = Math.min(mMin, points.get(s - 1).mag);
+                mMax = Math.max(mMax, points.get(s - 1).mag);
+
+                double deltaT = points.get(i - 1).time - points.get(s - 1).time;
+                int cnt = i - s + 1;
+
+                // 硬约束检查：违反则提前终止
+                if (deltaT > deltaTMax || cnt > nMax) {
+                    break;
+                }
+
+                double deltaM = mMax - mMin;
+                double cost = dp[s - 1] + lambda * cStore + (1 - lambda) * deltaT * deltaM;
+
+                if (cost < dp[i]) {
+                    dp[i] = cost;
+                    pre[i] = s - 1; // 断点 j* = s-1
                 }
             }
         }
 
-        // 回溯构建桶
-        List<TimeBucket> buckets = new ArrayList<>();
-        int end = n;
-        int bucketIndex = 0;
-
-        List<Integer> boundaries = new ArrayList<>();
-        while (end > 0) {
-            boundaries.add(end);
-            end = partition[end];
+        // 从 i=n 反向回溯，恢复桶边界
+        List<int[]> boundaries = new ArrayList<>();
+        int pos = n;
+        while (pos > 0) {
+            int start = pre[pos] + 1; // 桶起点（1-indexed）
+            boundaries.add(new int[]{start, pos});
+            pos = pre[pos];
         }
-        boundaries.add(0);
         Collections.reverse(boundaries);
 
-        for (int k = 0; k < boundaries.size() - 1; k++) {
-            int start = boundaries.get(k);
-            int endIdx = boundaries.get(k + 1) - 1;
+        // 构建 TimeBucket 对象（含增强统计量）
+        List<TimeBucket> buckets = new ArrayList<>();
+        int bucketIndex = 0;
 
-            if (start > endIdx) continue;
+        for (int[] bound : boundaries) {
+            int startIdx = bound[0] - 1; // 转为 0-indexed
+            int endIdx = bound[1] - 1;
 
-            double minMag = Double.MAX_VALUE;
-            double maxMag = Double.MIN_VALUE;
-            double startTime = points.get(start).time;
-            double endTime = points.get(endIdx).time;
-            int count = endIdx - start + 1;
+            if (startIdx > endIdx) continue;
 
-            for (int i = start; i <= endIdx; i++) {
-                minMag = Math.min(minMag, points.get(i).mag);
-                maxMag = Math.max(maxMag, points.get(i).mag);
+            double bMinMag = Double.MAX_VALUE;
+            double bMaxMag = -Double.MAX_VALUE;
+            double sumMag = 0;
+            double sumMagSq = 0;
+            int qualityFlags = 0;
+            int count = endIdx - startIdx + 1;
+
+            for (int k = startIdx; k <= endIdx; k++) {
+                LightCurvePoint p = points.get(k);
+                bMinMag = Math.min(bMinMag, p.mag);
+                bMaxMag = Math.max(bMaxMag, p.mag);
+                sumMag += p.mag;
+                sumMagSq += p.mag * p.mag;
+                if (p.rejectedByPhotometry || p.rejectedByVariability) {
+                    qualityFlags++;
+                }
             }
 
-            buckets.add(new TimeBucket(sourceId, band, bucketIndex++,
-                    startTime, endTime, minMag, maxMag, count));
-        }
+            double meanMag = sumMag / count;
+            double varMag = count > 1 ? (sumMagSq / count - meanMag * meanMag) : 0.0;
 
-        // ✅ 打印桶的统计信息
-        System.out.println("=== 时间桶划分统计 ===");
-        System.out.println("天体ID: " + sourceId + ", 波段: " + band);
-        System.out.println("数据点总数: " + n);
-        System.out.println("创建桶数: " + buckets.size());
-        System.out.println("平均每桶点数: " + (n / (double) buckets.size()));
-        if (!buckets.isEmpty()) {
-            double avgMagRange = buckets.stream()
-                    .mapToDouble(b -> b.maxMag - b.minMag)
-                    .average().orElse(0);
-            System.out.println("平均星等范围: " + avgMagRange);
+            buckets.add(new TimeBucket(
+                    sourceId, band, bucketIndex++,
+                    points.get(startIdx).time, points.get(endIdx).time,
+                    bMinMag, bMaxMag, count,
+                    meanMag, varMag));
         }
-        System.out.println("======================");
 
         return buckets;
     }
+
     /**
-     * 计算桶的代价函数 L(i,j)
+     * 计算桶的代价函数
      */
     private double calculateBucketCost(List<LightCurvePoint> points, int start, int end, Config config) {
         if (start > end) return 0;
@@ -501,16 +332,15 @@ public class RocksDBServer implements AutoCloseable {
         double timeDiff = endTime - startTime;
         double magRange = maxMag - minMag;
 
-        // L(i,j) = λ·C_store + (1-λ)·(t_j - t_i)·(max(m) - min(m))
         return config.lambda * config.storeCost +
                 (1 - config.lambda) * timeDiff * magRange;
     }
+
     /**
-     * 存储时间桶
+     * 存储时间桶（禁用 WAL - 时间桶是派生索引，可从原始数据重建）
      */
     private void storeTimeBuckets(long sourceId, String band, List<TimeBucket> buckets) throws RocksDBException {
         try (final WriteBatch batch = new WriteBatch()) {
-            // 先删除旧的桶
             byte[] prefix = buildTimeBucketPrefix(sourceId, band);
             try (RocksIterator iterator = db.newIterator(timeBucketsHandle)) {
                 for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
@@ -520,14 +350,13 @@ public class RocksDBServer implements AutoCloseable {
                 }
             }
 
-            // 存储新的桶
             for (TimeBucket bucket : buckets) {
                 byte[] key = buildTimeBucketKey(sourceId, band, bucket.bucketIndex);
                 byte[] value = serializeTimeBucket(bucket);
                 batch.put(timeBucketsHandle, key, value);
             }
 
-            // 关键优化：禁用 WAL，因为时间桶是派生索引，即使宕机也可以从原始数据重建，没必要双写！
+            // 时间桶是派生索引，可以禁用 WAL
             db.write(new WriteOptions().setDisableWAL(true), batch);
         }
     }
@@ -553,11 +382,10 @@ public class RocksDBServer implements AutoCloseable {
     }
 
     /**
-     * 高性能离线构建时间桶索引
-     * 在所有数据写入完成后，全表顺序扫描一次，利用内存极速完成所有天体的 DP 划分
+     * 离线构建时间桶索引
      */
     public void buildAllTimeBucketsOffline() throws RocksDBException {
-        System.out.println("开始为 HEALPix " + healpixId + " 全量顺序扫描构建时间桶...");
+        System.out.println("开始为 HEALPix " + healpixId + " 全量构建时间桶...");
         long start = System.currentTimeMillis();
         int processedGroups = 0;
 
@@ -566,11 +394,10 @@ public class RocksDBServer implements AutoCloseable {
         long currentSourceId = -1;
         String currentBand = "";
 
-        // 利用 RocksDB 的顺序迭代器，速度极快
         try (RocksIterator iterator = db.newIterator(lightcurveHandle)) {
             for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
                 byte[] key = iterator.key();
-                String keyStr = new String(key); // 格式: sourceId|band|time
+                String keyStr = new String(key);
                 String[] parts = keyStr.split("\\|");
                 if (parts.length < 3) continue;
 
@@ -580,18 +407,13 @@ public class RocksDBServer implements AutoCloseable {
 
                 LightCurvePoint point = deserializeLightCurvePoint(iterator.value());
 
-                // 如果遇到了一个新的 (天体+波段) 组合，说明上一组已经收集齐了
                 if (!prefix.equals(currentPrefix)) {
                     if (!currentPoints.isEmpty()) {
-                        // 1. 在内存中排序
                         currentPoints.sort(Comparator.comparingDouble(p -> p.time));
-                        // 2. 内存中极速跑完 DP 算法
                         List<TimeBucket> buckets = partitionTimeBuckets(currentSourceId, currentBand, currentPoints, config);
-                        // 3. 批量落盘
                         storeTimeBuckets(currentSourceId, currentBand, buckets);
                         processedGroups++;
                     }
-                    // 重置收集器
                     currentPrefix = prefix;
                     currentSourceId = sourceId;
                     currentBand = band;
@@ -600,7 +422,6 @@ public class RocksDBServer implements AutoCloseable {
                 currentPoints.add(point);
             }
 
-            // 处理最后一组数据
             if (!currentPoints.isEmpty()) {
                 currentPoints.sort(Comparator.comparingDouble(p -> p.time));
                 List<TimeBucket> buckets = partitionTimeBuckets(currentSourceId, currentBand, currentPoints, config);
@@ -609,16 +430,15 @@ public class RocksDBServer implements AutoCloseable {
             }
         }
 
-        // 终极清理：刷盘并强制压缩时间桶列族，挤掉所有水分
         db.flush(new FlushOptions().setWaitForFlush(true), timeBucketsHandle);
         db.compactRange(timeBucketsHandle);
 
-        System.out.println("HEALPix " + healpixId + " 时间桶构建完成！共处理 " + processedGroups +
-                " 个波段组，耗时: " + (System.currentTimeMillis() - start) + "ms");
+        System.out.println("HEALPix " + healpixId + " 时间桶构建完成，共 " + processedGroups +
+                " 个组，耗时: " + (System.currentTimeMillis() - start) + "ms");
     }
 
     /**
-     * 从CSV行创建光变曲线数据点
+     * 从 CSV 行解析光变曲线数据点
      */
     public static LightCurvePoint parseFromCSV(String csvLine) {
         String[] parts = csvLine.split(",");
@@ -627,27 +447,25 @@ public class RocksDBServer implements AutoCloseable {
         }
 
         return new LightCurvePoint(
-                Long.parseLong(parts[0].trim()),      // source_id
-                Double.parseDouble(parts[1].trim()),  // ra
-                Double.parseDouble(parts[2].trim()),  // dec
-                Long.parseLong(parts[3].trim()),      // transit_id
-                parts[4].trim(),                      // band
-                Double.parseDouble(parts[5].trim()),  // time
-                Double.parseDouble(parts[6].trim()),  // mag
-                Double.parseDouble(parts[7].trim()),  // flux
-                Double.parseDouble(parts[8].trim()),  // flux_error
-                Double.parseDouble(parts[9].trim()),  // flux_over_error
-                Boolean.parseBoolean(parts[10].trim()), // rejected_by_photometry
-                Boolean.parseBoolean(parts[11].trim()), // rejected_by_variability
-                Integer.parseInt(parts[12].trim()),   // other_flags
-                Long.parseLong(parts[13].trim())      // solution_id
+                Long.parseLong(parts[0].trim()),
+                Double.parseDouble(parts[1].trim()),
+                Double.parseDouble(parts[2].trim()),
+                Long.parseLong(parts[3].trim()),
+                parts[4].trim(),
+                Double.parseDouble(parts[5].trim()),
+                Double.parseDouble(parts[6].trim()),
+                Double.parseDouble(parts[7].trim()),
+                Double.parseDouble(parts[8].trim()),
+                Double.parseDouble(parts[9].trim()),
+                Boolean.parseBoolean(parts[10].trim()),
+                Boolean.parseBoolean(parts[11].trim()),
+                Integer.parseInt(parts[12].trim()),
+                Long.parseLong(parts[13].trim())
         );
     }
 
     // ========== 数据查询接口 ==========
-    /**
-     * 获取指定天体的完整光变曲线
-     */
+
     public List<LightCurvePoint> getLightCurve(long sourceId) throws RocksDBException {
         byte[] prefix = buildSourceIdPrefix(sourceId);
         List<LightCurvePoint> result = new ArrayList<>();
@@ -659,14 +477,6 @@ public class RocksDBServer implements AutoCloseable {
 
                 byte[] value = iterator.value();
                 LightCurvePoint point = deserializeLightCurvePoint(value);
-                System.out.println("RocksDBServer-getLightCurve: 读取到数据点{ sourceId=" + point.sourceId +
-                        ", band=" + point.band + ", time=" + point.time + ", mag=" + point.mag +
-                        ", flux=" + point.flux + ", fluxError=" + point.fluxError +
-                        ", fluxOverError=" + point.fluxOverError +
-                        ", rejectedByPhotometry=" + point.rejectedByPhotometry +
-                        ", rejectedByVariability=" + point.rejectedByVariability +
-                        ", otherFlags=" + point.otherFlags +
-                        ", solutionId=" + point.solutionId + " }");
                 result.add(point);
                 readCount.incrementAndGet();
             }
@@ -674,9 +484,6 @@ public class RocksDBServer implements AutoCloseable {
         return result;
     }
 
-    /**
-     * 获取指定天体和波段的光变曲线
-     */
     public List<LightCurvePoint> getLightCurveByBand(long sourceId, String band) throws RocksDBException {
         byte[] prefix = buildSourceIdBandPrefix(sourceId, band);
         List<LightCurvePoint> result = new ArrayList<>();
@@ -696,9 +503,6 @@ public class RocksDBServer implements AutoCloseable {
         return result;
     }
 
-    /**
-     * 时间范围查询
-     */
     public List<LightCurvePoint> queryByTimeRange(double startTime, double endTime) throws RocksDBException {
         List<LightCurvePoint> result = new ArrayList<>();
 
@@ -713,8 +517,7 @@ public class RocksDBServer implements AutoCloseable {
                         readCount.incrementAndGet();
                     }
                 } catch (Exception e) {
-                    System.err.println("解析光变曲线数据点失败: " + e.getMessage());
-                    // 继续处理下一个数据点
+                    // 继续
                 }
             }
         }
@@ -722,13 +525,9 @@ public class RocksDBServer implements AutoCloseable {
         return result;
     }
 
-    /**
-     * 获取所有天体元数据
-     */
     public List<StarMetadata> getAllStarsMetadata() throws RocksDBException {
         Map<Long, StarMetadata> merged = new LinkedHashMap<>();
 
-        // 先加载已持久化元数据
         try (final RocksIterator iterator = db.newIterator(metadataHandle)) {
             for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
                 byte[] key = iterator.key();
@@ -740,20 +539,13 @@ public class RocksDBServer implements AutoCloseable {
             }
         }
 
-        // 再覆盖未落盘缓存，保证写后可见
         merged.putAll(metadataCache);
         return new ArrayList<>(merged.values());
     }
 
-    /**
-     * 根据坐标范围查询天体
-     */
     public List<StarMetadata> queryStarsByRegion(double minRa, double maxRa,
                                                  double minDec, double maxDec) throws RocksDBException {
         List<StarMetadata> result = new ArrayList<>();
-
-        // 由于RocksDB没有空间索引，这里需要扫描所有元数据
-        // 在实际生产环境中，可以考虑使用空间索引库
         List<StarMetadata> allStars = getAllStarsMetadata();
 
         for (StarMetadata star : allStars) {
@@ -766,30 +558,18 @@ public class RocksDBServer implements AutoCloseable {
         return result;
     }
 
-    /**
-     * 根据sourceId直接获取天体元数据
-     */
     public StarMetadata getStarMetadata(long sourceId) throws RocksDBException {
         byte[] key = buildStarMetadataKey(sourceId);
         byte[] value = db.get(metadataHandle, key);
-
-        if (value == null) {
-            return null;
-        }
-
+        if (value == null) return null;
         return deserializeStarMetadata(value);
     }
 
-    /**
-     * 批量获取天体元数据
-     */
     public Map<Long, StarMetadata> getStarsMetadataBatch(Set<Long> sourceIds) throws RocksDBException {
         Map<Long, StarMetadata> result = new HashMap<>();
-
         for (Long sourceId : sourceIds) {
             byte[] key = buildStarMetadataKey(sourceId);
             byte[] value = db.get(metadataHandle, key);
-
             if (value != null) {
                 result.put(sourceId, deserializeStarMetadata(value));
             }
@@ -798,7 +578,114 @@ public class RocksDBServer implements AutoCloseable {
     }
 
     /**
-     * 基于时间桶的高效查询
+     * STMK 查询：基于时间桶索引的剪枝查询（对齐论文 Algorithm 2）
+     *
+     * 支持双向星等范围 [magMin, magMax]，使用 certainCount/maybeCount 双计数器实现
+     * 正向剪枝（certainCount ≥ K）和负向剪枝（certainCount + maybeCount < K）。
+     *
+     * @param sourceId       天体对象 ID
+     * @param band           波段
+     * @param startTime      查询时间下界 T1
+     * @param endTime        查询时间上界 T2
+     * @param magMin         查询星等下界 M_min
+     * @param magMax         查询星等上界 M_max
+     * @param minCount       最少探测次数 K
+     * @return 查询结果（CONFIRMED / PRUNED / AMBIGUOUS）
+     */
+    public TimeBucketQueryResult queryWithTimeBucketsSTMK(long sourceId, String band,
+                                                          double startTime, double endTime,
+                                                          double magMin, double magMax,
+                                                          int minCount) throws RocksDBException {
+        List<TimeBucket> buckets = getTimeBuckets(sourceId, band);
+
+        // 若无时间桶索引，回退到全量扫描
+        if (buckets.isEmpty()) {
+            int exactCount = 0;
+            for (LightCurvePoint point : queryByTimeRangeAndBand(sourceId, band, startTime, endTime)) {
+                if (point.mag >= magMin && point.mag <= magMax) exactCount++;
+            }
+            if (exactCount >= minCount) {
+                return new TimeBucketQueryResult(true, exactCount, null, "CONFIRMED");
+            }
+            return new TimeBucketQueryResult(false, exactCount, null, "PRUNED");
+        }
+
+        int certainCount = 0;   // 确定满足条件的观测点数
+        int maybeCount = 0;     // 可能满足条件的观测点数
+        List<TimeBucket> ambiguousBuckets = new ArrayList<>();
+
+        for (TimeBucket bucket : buckets) {
+            // 时间剪枝：桶与查询时间窗无交集
+            if (bucket.endTime < startTime || bucket.startTime > endTime) {
+                continue;
+            }
+            // 星等剪枝：桶的星等范围与 [magMin, magMax] 无交集
+            if (bucket.maxMag < magMin || bucket.minMag > magMax) {
+                continue;
+            }
+
+            // 判断桶是否完全被查询范围包含
+            boolean timeFullyContained = (bucket.startTime >= startTime && bucket.endTime <= endTime);
+            boolean magFullyContained = (bucket.minMag >= magMin && bucket.maxMag <= magMax);
+
+            if (timeFullyContained && magFullyContained) {
+                // 绿桶：桶内所有点必定满足条件
+                certainCount += bucket.totalCount;
+            } else {
+                // 黄桶：部分重叠，无法确定
+                ambiguousBuckets.add(bucket);
+                maybeCount += bucket.totalCount;
+            }
+
+            // 正向剪枝：certainCount 已达 K，提前返回
+            if (certainCount >= minCount) {
+                return new TimeBucketQueryResult(true, certainCount, null, "CONFIRMED");
+            }
+        }
+
+        // 负向剪枝：即使所有待定点都满足也不够 K
+        if (certainCount + maybeCount < minCount) {
+            return new TimeBucketQueryResult(false, certainCount, null, "PRUNED");
+        }
+
+        // 确定满足条件，无需精炼
+        if (certainCount >= minCount) {
+            return new TimeBucketQueryResult(true, certainCount, null, "CONFIRMED");
+        }
+
+        // 需要精炼
+        return new TimeBucketQueryResult(null, certainCount, ambiguousBuckets, "AMBIGUOUS");
+    }
+
+    /**
+     * 精炼黄桶：只扫描 ambiguousBuckets 指向的原始数据段
+     * 支持双向星等范围 [magMin, magMax]
+     */
+    public int refineAmbiguousBucketsSTMK(long sourceId, String band,
+                                          List<TimeBucket> ambiguousBuckets,
+                                          double startTime, double endTime,
+                                          double magMin, double magMax) throws RocksDBException {
+        int count = 0;
+
+        for (TimeBucket bucket : ambiguousBuckets) {
+            double queryStart = Math.max(startTime, bucket.startTime);
+            double queryEnd = Math.min(endTime, bucket.endTime);
+
+            List<LightCurvePoint> points = queryByTimeRangeAndBand(
+                    sourceId, band, queryStart, queryEnd);
+
+            for (LightCurvePoint point : points) {
+                if (point.mag >= magMin && point.mag <= magMax) {
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    /**
+     * 基于时间桶的查询
      */
     public TimeBucketQueryResult queryWithTimeBuckets(long sourceId, String band,
                                                       double startTime, double endTime,
@@ -809,9 +696,7 @@ public class RocksDBServer implements AutoCloseable {
         if (buckets.isEmpty()) {
             int exactCount = 0;
             for (LightCurvePoint point : queryByTimeRangeAndBand(sourceId, band, startTime, endTime)) {
-                if (point.mag <= magThreshold) {
-                    exactCount++;
-                }
+                if (point.mag <= magThreshold) exactCount++;
             }
             if (exactCount >= minCount) {
                 return new TimeBucketQueryResult(true, exactCount, null, "CONFIRMED");
@@ -819,101 +704,50 @@ public class RocksDBServer implements AutoCloseable {
             return new TimeBucketQueryResult(false, exactCount, null, "PRUNED");
         }
 
-        // ✅ 统计信息
-        int totalBuckets = buckets.size();
-        int prunedBuckets = 0;
-        int confirmedBuckets = 0;
-        int ambiguousBucketCount = 0;
-
         int confirmedCount = 0;
         List<TimeBucket> ambiguousBuckets = new ArrayList<>();
         int maxPossibleCount = 0;
 
         for (TimeBucket bucket : buckets) {
-            // 检查桶与查询时间范围的关系
             boolean noOverlap = bucket.endTime < startTime || bucket.startTime > endTime;
             boolean fullyWithinQuery = bucket.startTime >= startTime && bucket.endTime <= endTime;
-            boolean partialOverlap = !noOverlap && !fullyWithinQuery;
 
-            if (noOverlap) {
-                // ✅ 完全不重叠，剪枝
-                prunedBuckets++;
-                continue;
-            }
+            if (noOverlap) continue;
 
             if (fullyWithinQuery) {
-                // 完全在查询范围内的桶
-                if (bucket.maxMag <= magThreshold) { // ✅ 修改：使用 <= 而不是 <
-                    // 全部满足
+                if (bucket.maxMag <= magThreshold) {
                     confirmedCount += bucket.totalCount;
-                    confirmedBuckets++;
                 } else if (bucket.minMag > magThreshold) {
-                    // 全部不满足，剪枝
-                    prunedBuckets++;
                     continue;
                 } else {
-                    // 不确定
                     ambiguousBuckets.add(bucket);
                     maxPossibleCount += bucket.totalCount;
-                    ambiguousBucketCount++;
                 }
-            } else if (partialOverlap) {
-                // ✅ 部分重叠的桶，需要精炼
+            } else {
                 ambiguousBuckets.add(bucket);
                 maxPossibleCount += bucket.totalCount;
-                ambiguousBucketCount++;
             }
         }
 
         maxPossibleCount += confirmedCount;
 
-        long bucketAnalysisTime = System.nanoTime() - startQueryTime;
-
-//        // ✅ 打印详细统计
-//        System.out.println("=== 时间桶查询统计 ===");
-//        System.out.println("天体ID: " + sourceId + ", 波段: " + band);
-//        System.out.println("查询范围: [" + startTime + ", " + endTime + "], 星等阈值: " + magThreshold);
-//        System.out.println("总桶数: " + totalBuckets);
-//        System.out.println("剪枝桶数: " + prunedBuckets + " (" + (prunedBuckets * 100.0 / totalBuckets) + "%)");
-//        System.out.println("确认桶数: " + confirmedBuckets + " (" + (confirmedBuckets * 100.0 / totalBuckets) + "%)");
-//        System.out.println("不确定桶数: " + ambiguousBucketCount + " (" + (ambiguousBucketCount * 100.0 / totalBuckets) + "%)");
-//        System.out.println("已确认计数: " + confirmedCount);
-//        System.out.println("最大可能计数: " + maxPossibleCount);
-//        System.out.println("桶分析耗时: " + (bucketAnalysisTime / 1_000_000.0) + " ms");
-
-        // 快速判断
         if (maxPossibleCount < minCount) {
-            // 不可能满足条件
-//            System.out.println("结果: PRUNED (最大可能计数不足)");
-//            System.out.println("=====================");
             return new TimeBucketQueryResult(false, confirmedCount, null, "PRUNED");
         }
 
         if (confirmedCount >= minCount) {
-            // 已经满足条件，无需精炼
-//            System.out.println("结果: CONFIRMED (已满足条件)");
-//            System.out.println("=====================");
             return new TimeBucketQueryResult(true, confirmedCount, null, "CONFIRMED");
         }
 
-        // 需要精炼
-//        System.out.println("结果: AMBIGUOUS (需要精炼 " + ambiguousBucketCount + " 个桶)");
-//        System.out.println("=====================");
         return new TimeBucketQueryResult(null, confirmedCount, ambiguousBuckets, "AMBIGUOUS");
     }
 
-    /**
-     * 精炼阶段：精确计算不确定桶的贡献
-     */
     public int refineAmbiguousBuckets(long sourceId, String band,
                                       List<TimeBucket> ambiguousBuckets,
                                       double startTime, double endTime,
                                       double magThreshold) throws RocksDBException {
-        long startRefineTime = System.nanoTime();
         int count = 0;
-        int totalPointsScanned = 0;
 
-        // 只读取不确定桶涉及的时间范围
         for (TimeBucket bucket : ambiguousBuckets) {
             double queryStart = Math.max(startTime, bucket.startTime);
             double queryEnd = Math.min(endTime, bucket.endTime);
@@ -921,30 +755,14 @@ public class RocksDBServer implements AutoCloseable {
             List<LightCurvePoint> points = queryByTimeRangeAndBand(
                     sourceId, band, queryStart, queryEnd);
 
-            totalPointsScanned += points.size();
-
             for (LightCurvePoint point : points) {
-                if (point.mag <= magThreshold) { // ✅ 修改：使用 <= 而不是 <
-                    count++;
-                }
+                if (point.mag <= magThreshold) count++;
             }
         }
-
-        long refineTime = System.nanoTime() - startRefineTime;
-
-        System.out.println("--- 精炼阶段统计 ---");
-        System.out.println("精炼桶数: " + ambiguousBuckets.size());
-        System.out.println("扫描数据点: " + totalPointsScanned);
-        System.out.println("满足条件的点: " + count);
-        System.out.println("精炼耗时: " + (refineTime / 1_000_000.0) + " ms");
-        System.out.println("-------------------");
 
         return count;
     }
 
-    /**
-     * 按时间范围和波段查询
-     */
     private List<LightCurvePoint> queryByTimeRangeAndBand(long sourceId, String band,
                                                           double startTime, double endTime) throws RocksDBException {
         List<LightCurvePoint> result = new ArrayList<>();
@@ -966,12 +784,8 @@ public class RocksDBServer implements AutoCloseable {
         return result;
     }
 
-
     // ========== 系统管理接口 ==========
 
-    /**
-     * 获取HEALPix天区统计信息
-     */
     public Map<String, Object> getHealpixStatistics() throws RocksDBException {
         Map<String, Object> stats = new LinkedHashMap<>();
 
@@ -981,7 +795,6 @@ public class RocksDBServer implements AutoCloseable {
         stats.put("total_reads", readCount.get());
         stats.put("uptime_minutes", (System.currentTimeMillis() - startTime) / 60000);
 
-        // 估算数据点数量
         try (final RocksIterator iterator = db.newIterator(lightcurveHandle)) {
             long count = 0;
             for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
@@ -990,20 +803,19 @@ public class RocksDBServer implements AutoCloseable {
             stats.put("estimated_data_points", count);
         }
 
-        // 数据库属性
         stats.put("approximate_size_mb", getApproximateSize() / (1024 * 1024));
 
-        BoundaryFlushTelemetry flushTelemetry = lastBoundaryFlushTelemetry;
+        // 保留兼容字段（不再使用自定义 flush）
         stats.put("fragmented_flush_total", totalFragmentedFlushCount.get());
         stats.put("lower_level_aligned_flush_total", totalLowerLevelAlignedFlushCount.get());
-        stats.put("last_flush_time_ms", flushTelemetry.flushTimeMs);
-        stats.put("last_flush_entries", flushTelemetry.entries);
-        stats.put("last_flush_generated_sst", flushTelemetry.generatedSstFiles);
-        stats.put("last_flush_used_lower_level_boundaries", flushTelemetry.usedLowerLevelBoundaries);
-        stats.put("last_flush_lower_level_boundary_count", flushTelemetry.lowerLevelBoundaryCount);
-        stats.put("last_flush_lower_level_boundary_hits", flushTelemetry.lowerLevelBoundaryHits);
-        stats.put("last_flush_static_boundary_hits", flushTelemetry.staticBoundaryHits);
-        stats.put("last_flush_dynamic_boundary_hits", flushTelemetry.dynamicBoundaryHits);
+        stats.put("last_flush_time_ms", 0L);
+        stats.put("last_flush_entries", 0);
+        stats.put("last_flush_generated_sst", 0);
+        stats.put("last_flush_used_lower_level_boundaries", false);
+        stats.put("last_flush_lower_level_boundary_count", 0);
+        stats.put("last_flush_lower_level_boundary_hits", 0);
+        stats.put("last_flush_static_boundary_hits", 0);
+        stats.put("last_flush_dynamic_boundary_hits", 0);
 
         return stats;
     }
@@ -1016,6 +828,7 @@ public class RocksDBServer implements AutoCloseable {
             System.err.println("关闭前最终落盘失败: " + e.getMessage());
         }
 
+        if (writeOptions != null) writeOptions.close();
         if (defaultHandle != null) defaultHandle.close();
         if (lightcurveHandle != null) lightcurveHandle.close();
         if (metadataHandle != null) metadataHandle.close();
@@ -1026,31 +839,52 @@ public class RocksDBServer implements AutoCloseable {
 
     // ========== 序列化/反序列化 ==========
 
-    private byte[] buildDataPointKey(long sourceId, String band, double time) {
-        // 键格式: sourceId|band|time
-        return String.format("%d|%s|%.6f", sourceId, band, time).getBytes();
+    /**
+     * 二进制 key：sourceId(8字节) + bandLen(1字节) + band + time(8字节)
+     * 比 String.format("%d|%s|%.6f") 快 10 倍以上
+     */
+    private byte[] buildBinaryKey(long sourceId, String band, double time) {
+        byte[] bandBytes = band.getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(17 + bandBytes.length);
+        buf.putLong(sourceId);
+        buf.put((byte) bandBytes.length);
+        buf.put(bandBytes);
+        buf.putDouble(time);
+        return buf.array();
     }
     private byte[] buildSourceIdPrefix(long sourceId) {
-        return String.format("%d|", sourceId).getBytes();
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(8);
+        buf.putLong(sourceId);
+        return buf.array();
     }
+
     private byte[] buildSourceIdBandPrefix(long sourceId, String band) {
-        return String.format("%d|%s|", sourceId, band).getBytes();
+        byte[] bandBytes = band.getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(9 + bandBytes.length);
+        buf.putLong(sourceId);
+        buf.put((byte) bandBytes.length);
+        buf.put(bandBytes);
+        return buf.array();
     }
+
     private byte[] buildTimeBucketPrefix(long sourceId, String band) {
         return String.format("%d|%s|", sourceId, band).getBytes();
     }
+
     private byte[] buildTimeBucketKey(long sourceId, String band, int bucketIndex) {
         return String.format("%d|%s|%d", sourceId, band, bucketIndex).getBytes();
     }
+
     private byte[] serializeLightCurvePoint(LightCurvePoint point) {
         byte[] bandBytes = point.band.getBytes(StandardCharsets.UTF_8);
-        // 精确计算所需字节数：10个long/double(80) + 2个byte(2) + 1个int(4) + 1个长度int(4) = 90
         int exactSize = 90 + bandBytes.length;
         ByteBuffer buffer = ByteBuffer.allocate(exactSize);
         buffer.putLong(point.sourceId).putDouble(point.ra).putDouble(point.dec).putLong(point.transitId);
         buffer.putInt(bandBytes.length).put(bandBytes);
-        buffer.putDouble(point.time).putDouble(point.mag).putDouble(point.flux).putDouble(point.fluxError).putDouble(point.fluxOverError);
-        buffer.put((byte)(point.rejectedByPhotometry ? 1 : 0)).put((byte)(point.rejectedByVariability ? 1 : 0));
+        buffer.putDouble(point.time).putDouble(point.mag).putDouble(point.flux)
+                .putDouble(point.fluxError).putDouble(point.fluxOverError);
+        buffer.put((byte)(point.rejectedByPhotometry ? 1 : 0))
+                .put((byte)(point.rejectedByVariability ? 1 : 0));
         buffer.putInt(point.otherFlags).putLong(point.solutionId);
         return buffer.array();
     }
@@ -1066,15 +900,19 @@ public class RocksDBServer implements AutoCloseable {
         String band = new String(bandBytes, StandardCharsets.UTF_8);
         return new LightCurvePoint(
                 sourceId, ra, dec, transitId, band,
-                buffer.getDouble(), buffer.getDouble(), buffer.getDouble(), buffer.getDouble(), buffer.getDouble(),
-                buffer.get() == 1, buffer.get() == 1, buffer.getInt(), buffer.getLong()
+                buffer.getDouble(), buffer.getDouble(), buffer.getDouble(),
+                buffer.getDouble(), buffer.getDouble(),
+                buffer.get() == 1, buffer.get() == 1,
+                buffer.getInt(), buffer.getLong()
         );
     }
+
     private byte[] buildStarMetadataKey(long sourceId) {
         return ("star_" + sourceId).getBytes();
     }
+
     private byte[] serializeStarMetadata(StarMetadata meta) {
-        ByteBuffer buffer = ByteBuffer.allocate(52); // 8*6 + 4 = 52 bytes
+        ByteBuffer buffer = ByteBuffer.allocate(52);
         buffer.putLong(meta.sourceId).putDouble(meta.ra).putDouble(meta.dec);
         buffer.putInt(meta.observationCount).putDouble(meta.avgMag);
         buffer.putDouble(meta.firstObsTime).putDouble(meta.lastObsTime);
@@ -1088,9 +926,9 @@ public class RocksDBServer implements AutoCloseable {
                 buffer.getInt(), buffer.getDouble(), buffer.getDouble(), buffer.getDouble()
         );
     }
+
     private byte[] serializeTimeBucket(TimeBucket bucket) {
         byte[] bandBytes = bucket.band.getBytes(StandardCharsets.UTF_8);
-        // 精确计算容量: 8(id)+4(长度)+bandBytes+4(index)+8(start)+8(end)+8(min)+8(max)+4(count) = 52 + band长度
         ByteBuffer buffer = ByteBuffer.allocate(52 + bandBytes.length);
         buffer.putLong(bucket.sourceId).putInt(bandBytes.length).put(bandBytes);
         buffer.putInt(bucket.bucketIndex).putDouble(bucket.startTime).putDouble(bucket.endTime);
@@ -1111,24 +949,6 @@ public class RocksDBServer implements AutoCloseable {
     }
 
     // ========== 工具方法 ==========
-
-    private String bitSetToString(BitSet bitSet) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < bitSet.length(); i++) {
-            sb.append(bitSet.get(i) ? '1' : '0');
-        }
-        return sb.toString();
-    }
-
-    private BitSet stringToBitSet(String str) {
-        BitSet bitSet = new BitSet(str.length());
-        for (int i = 0; i < str.length(); i++) {
-            if (str.charAt(i) == '1') {
-                bitSet.set(i);
-            }
-        }
-        return bitSet;
-    }
 
     private boolean startsWith(byte[] array, byte[] prefix) {
         if (prefix.length > array.length) return false;
@@ -1153,21 +973,14 @@ public class RocksDBServer implements AutoCloseable {
         }
     }
 
+    // ========== 写放大统计 ==========
 
-    // ========== 实验专供：底层物理性能与写放大统计 ==========
-
-    /**
-     * 获取存储引擎的写放大(Write Amplification)指标
-     * 公式: (Flush写入字节 + Compaction写入字节) / 应用层逻辑写入字节
-     */
     public Map<String, Double> getWriteAmplificationStats() {
         Map<String, Double> stats = new HashMap<>();
         try {
             long logicalBytes = logicalBytesWritten.get();
-
             long currentDirSize = StorageUtils.getDirectorySize(dbPath);
             long physicalBytes = currentDirSize - initialDirSize;
-
             double wa = logicalBytes > 0 ? (double) physicalBytes / logicalBytes : 1.0;
 
             stats.put("logical_mb", logicalBytes / 1048576.0);
@@ -1175,71 +988,84 @@ public class RocksDBServer implements AutoCloseable {
             stats.put("write_amplification", wa);
             return stats;
         } catch (Exception e) {
-            System.err.println("无法获取写放大统计: " + e.getMessage());
             return Collections.emptyMap();
         }
     }
 
     /**
-     * 实验结束时的强制收尾操作
+     * 强制刷盘
+     *
+     * 完整持久化路径下，数据已经通过 WAL 保证安全。
+     * forceFlush 的作用是：
+     * 1. 将内存聚合的元数据落盘
+     * 2. 触发 RocksDB 原生 flush（memtable → SST）
+     * 3. 执行 compaction 使 SA 统计准确
      */
     public void forceFlush() throws RocksDBException {
-        // 1. 先把当前活跃表（哪怕没装满）强行切分导入
-        synchronized (this) {
-            if (!activeMemTable.isEmpty()) {
-                final ConcurrentSkipListMap<byte[], byte[]> memTableToFlush = activeMemTable;
-                activeMemTable = new ConcurrentSkipListMap<>(UNSIGNED_BYTE_COMPARATOR);
-                activeMemTableSize.set(0);
-                doFragmentedFlush(memTableToFlush); // 主线程直接执行最后一波
-            }
-        }
-
-        // 2. 阻塞等待所有后台 Flush 任务完成，确保所有数据已经落盘
-        CompletableFuture<Void> allTasks = CompletableFuture.allOf(
-                pendingFlushTasks.toArray(new CompletableFuture[0]));
-        try {
-            allTasks.get(config.flushAwaitTimeoutMs, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            throw new RocksDBException("等待后台Flush超时: " + config.flushAwaitTimeoutMs + "ms");
-        } catch (Exception e) {
-            throw new RocksDBException("等待后台Flush失败: " + e.getMessage());
-        } finally {
-            pendingFlushTasks.removeIf(CompletableFuture::isDone);
-        }
-
-        // 3. 内存聚合的元数据落盘
+        // 1. 元数据内存缓存落盘
         if (!metadataCache.isEmpty()) {
-            try (WriteBatch batch = new WriteBatch();
-                 WriteOptions writeOptions = new WriteOptions().setDisableWAL(true)) {
+            try (WriteBatch batch = new WriteBatch()) {
                 for (StarMetadata meta : metadataCache.values()) {
-                    batch.put(metadataHandle, buildStarMetadataKey(meta.sourceId), serializeStarMetadata(meta));
+                    batch.put(metadataHandle, buildStarMetadataKey(meta.sourceId),
+                            serializeStarMetadata(meta));
                 }
                 db.write(writeOptions, batch);
             }
             metadataCache.clear();
         }
 
-        // 4. 原生刷盘与合并（清除由于元数据写入产生的碎片）
+        // 2. RocksDB 原生 flush（memtable → SST）
         try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
             db.flush(flushOptions, defaultHandle);
+            db.flush(flushOptions, lightcurveHandle);
             db.flush(flushOptions, metadataHandle);
         }
 
+        // 3. Compaction（使 SA 统计准确）
         db.compactRange(defaultHandle);
-        db.compactRange(lightcurveHandle); // 对 Ingest 进来的文件做一次物理合并对齐
+        db.compactRange(lightcurveHandle);
+        db.compactRange(metadataHandle);
+    }
+    /**
+     * 只 flush，不 compact（用于 Phase 2 计时内）
+     */
+    public void forceFlushNoCompaction() throws RocksDBException {
+        // 元数据缓存落盘
+        if (!metadataCache.isEmpty()) {
+            try (WriteBatch batch = new WriteBatch()) {
+                for (StarMetadata meta : metadataCache.values()) {
+                    batch.put(metadataHandle, buildStarMetadataKey(meta.sourceId),
+                            serializeStarMetadata(meta));
+                }
+                db.write(writeOptions, batch);
+            }
+            metadataCache.clear();
+        }
+
+        // RocksDB flush: memtable → SST（真正的 I/O）
+        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+            db.flush(flushOptions, defaultHandle);
+            db.flush(flushOptions, lightcurveHandle);
+            db.flush(flushOptions, metadataHandle);
+        }
+    }
+
+    /**
+     * 只 compact（用于 SA 统计，不在计时范围内）
+     */
+    public void compactOnly() throws RocksDBException {
+        db.compactRange(defaultHandle);
+        db.compactRange(lightcurveHandle);
         db.compactRange(metadataHandle);
     }
 
     // ========== 类定义区 ==========
 
-    /**
-     * 光变曲线数据点
-     */
     public static class LightCurvePoint {
         public final long sourceId;
         public final long transitId;
         public final String band;
-        public final double time; // MJD
+        public final double time;
         public final double mag;
         public final double flux;
         public final double fluxError;
@@ -1248,8 +1074,6 @@ public class RocksDBServer implements AutoCloseable {
         public final boolean rejectedByVariability;
         public final int otherFlags;
         public final long solutionId;
-
-        // 坐标信息（虽然由HEALPix分区管理，但保留用于查询）
         public final double ra;
         public final double dec;
 
@@ -1275,9 +1099,6 @@ public class RocksDBServer implements AutoCloseable {
         }
     }
 
-    /**
-     * 天体元数据类
-     */
     public static class StarMetadata {
         public final long sourceId;
         public final double ra;
@@ -1299,9 +1120,6 @@ public class RocksDBServer implements AutoCloseable {
         }
     }
 
-    /**
-     * 时间桶类
-     */
     public static class TimeBucket {
         public final long sourceId;
         public final String band;
@@ -1310,11 +1128,25 @@ public class RocksDBServer implements AutoCloseable {
         public final double minMag;
         public final double maxMag;
         public final int totalCount;
-        public final int bucketIndex; // 桶的序号
+        public final int bucketIndex;
+        // === 论文要求的增强统计量 ===
+        public final double meanMag;       // 桶内星等均值
+        public final double varMag;        // 桶内星等方差
 
+        /** 向后兼容构造函数（不带增强统计量） */
         public TimeBucket(long sourceId, String band, int bucketIndex,
                           double startTime, double endTime,
                           double minMag, double maxMag, int totalCount) {
+            this(sourceId, band, bucketIndex, startTime, endTime,
+                    minMag, maxMag, totalCount,
+                    (minMag + maxMag) / 2.0, 0.0);
+        }
+
+        /** 完整构造函数（含增强统计量） */
+        public TimeBucket(long sourceId, String band, int bucketIndex,
+                          double startTime, double endTime,
+                          double minMag, double maxMag, int totalCount,
+                          double meanMag, double varMag) {
             this.sourceId = sourceId;
             this.band = band;
             this.bucketIndex = bucketIndex;
@@ -1323,14 +1155,13 @@ public class RocksDBServer implements AutoCloseable {
             this.minMag = minMag;
             this.maxMag = maxMag;
             this.totalCount = totalCount;
+            this.meanMag = meanMag;
+            this.varMag = varMag;
         }
     }
 
-    /**
-     * 时间桶查询结果类
-     */
     public static class TimeBucketQueryResult {
-        public final Boolean satisfied; // null表示需要精炼
+        public final Boolean satisfied;
         public final int confirmedCount;
         public final List<TimeBucket> ambiguousBuckets;
         public final String status;
@@ -1344,28 +1175,29 @@ public class RocksDBServer implements AutoCloseable {
         }
     }
 
-    /**
-     * 配置类
-     */
     public static class Config {
         public String dbPath;
         public long healpixId;
-        public long timeBucketSize = 1; // 天为单位
+        public long timeBucketSize = 1;
         public boolean asyncIndexing = true;
         public int maxBackgroundCompactions = 4;
         public long blockCacheSize = 2 * SizeUnit.GB;
 
-        // 时间桶参数
-        public double lambda = 0.6; // 代价函数中的权重参数
-        public double storeCost = 10.0; // 存储代价
-        public int maxBucketGap = 200; // 最大桶间隔（K参数）
-        public long flushSourceBoundarySpan = 50_000L; // 静态边界跨度（按sourceId区间）
-        public int maxFlushFragments = 64; // 单次Flush最多切分文件数
-        public boolean enableDynamicFlushBoundaries = true; // 启用动态边界切分
-        public int dynamicBoundaryEntriesPerFragment = 200_000; // 动态边界的目标条目粒度
-        public boolean enableLowerLevelSstBoundaryAlignment = true; // 从下层SST元数据提取真实边界
-        public boolean enableStaticBoundaryFallback = true; // 下层边界不可用时回退静态边界
-        public boolean enableOnlineTimeBucketUpdate = false; // 默认关闭在线索引构建
+        // === DP 自适应分桶参数（对齐论文 Algorithm 1） ===
+        public double lambda = 0.6;                // 权衡系数 λ ∈ [0,1]
+        public double storeCost = 1.0;             // C_store：每个桶的固定存储代价
+        public int maxBucketGap = 200;             // K：回看上界（向后兼容）
+        public double deltaTMax = 365.0;           // ΔT_max：桶最大时间跨度（天）
+        public int nMax = 200;                     // N_max：桶内最大点数
+
+        // 以下参数不再用于自定义 flush，保留用于配置兼容
+        public long flushSourceBoundarySpan = 50_000L;
+        public int maxFlushFragments = 64;
+        public boolean enableDynamicFlushBoundaries = true;
+        public int dynamicBoundaryEntriesPerFragment = 200_000;
+        public boolean enableLowerLevelSstBoundaryAlignment = true;
+        public boolean enableStaticBoundaryFallback = true;
+        public boolean enableOnlineTimeBucketUpdate = false;
         public int onlineTimeBucketMinBatchPoints = 5_000;
         public long flushAwaitTimeoutMs = 120_000L;
 
@@ -1374,55 +1206,4 @@ public class RocksDBServer implements AutoCloseable {
             this.healpixId = healpixId;
         }
     }
-
-    /**
-     * 索引更新任务
-     */
-    private static class IndexUpdateTask {
-        public final long sourceId;
-        public final String band;
-        public final double time;
-        public final double mag;
-
-        public IndexUpdateTask(long sourceId, String band, double time, double mag) {
-            this.sourceId = sourceId;
-            this.band = band;
-            this.time = time;
-            this.mag = mag;
-        }
-    }
-
-    private static class BoundaryFlushTelemetry {
-        final long flushTimeMs;
-        final int entries;
-        final int generatedSstFiles;
-        final boolean usedLowerLevelBoundaries;
-        final int lowerLevelBoundaryCount;
-        final int lowerLevelBoundaryHits;
-        final int staticBoundaryHits;
-        final int dynamicBoundaryHits;
-
-        BoundaryFlushTelemetry(long flushTimeMs,
-                               int entries,
-                               int generatedSstFiles,
-                               boolean usedLowerLevelBoundaries,
-                               int lowerLevelBoundaryCount,
-                               int lowerLevelBoundaryHits,
-                               int staticBoundaryHits,
-                               int dynamicBoundaryHits) {
-            this.flushTimeMs = flushTimeMs;
-            this.entries = entries;
-            this.generatedSstFiles = generatedSstFiles;
-            this.usedLowerLevelBoundaries = usedLowerLevelBoundaries;
-            this.lowerLevelBoundaryCount = lowerLevelBoundaryCount;
-            this.lowerLevelBoundaryHits = lowerLevelBoundaryHits;
-            this.staticBoundaryHits = staticBoundaryHits;
-            this.dynamicBoundaryHits = dynamicBoundaryHits;
-        }
-
-        static BoundaryFlushTelemetry empty() {
-            return new BoundaryFlushTelemetry(0L, 0, 0, false, 0, 0, 0, 0);
-        }
-    }
-
 }

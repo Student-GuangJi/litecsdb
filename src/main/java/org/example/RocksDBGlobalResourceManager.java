@@ -10,48 +10,35 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * RocksDB Global Resource Manager
+ * RocksDB 全局资源管理器
  *
- * Aligned to TDengine C++ configuration:
- *   NUM_THREADS  = 16  -> WRITE_THREADS (client-side parallel writers)
- *   NUM_VGROUPS  = 32  -> DISTRIBUTION_PARALLELISM (healpix dispatch threads)
- *   BATCH_SIZE   = 10000 -> BATCH_SIZE (points per write batch)
- *   BUFFER_SIZE  = 256MB -> MEMTABLE_FLUSH_THRESHOLD per partition
- *
- * Total memory budget: managed by writeBufferManager (shared across all partitions)
+ * 配置对齐（所有系统统一）：
+ *   WRITE_THREADS           = 16  （并行写入线程数）
+ *   DISTRIBUTION_PARALLELISM = 32  （分发并行度）
+ *   BATCH_SIZE              = 10000（每批写入行数）
+ *   MEMTABLE_FLUSH_THRESHOLD = 256MB（由 RocksDB 原生 memtable 管理）
  */
 public class RocksDBGlobalResourceManager implements AutoCloseable {
     private static volatile RocksDBGlobalResourceManager instance;
 
-    // ==================== Config constants (aligned to TDengine) ====================
+    // ==================== 全局配置常量 ====================
 
-    /** Client-side parallel write threads (TDengine NUM_THREADS = 16) */
     public static final int WRITE_THREADS = 16;
-
-    /** Distribution parallelism for healpix dispatch (TDengine NUM_VGROUPS = 32) */
     public static final int DISTRIBUTION_PARALLELISM = 32;
-
-    /** Points per write batch (TDengine BATCH_SIZE = 10000) */
     public static final int BATCH_SIZE = 10_000;
-
-    /** Per-partition memtable flush threshold (TDengine BUFFER = 256MB per vgroup) */
     public static final long MEMTABLE_FLUSH_THRESHOLD = 256L * 1024 * 1024;
 
-    // ==================== Shared JNI resources ====================
+    // ==================== 共享 JNI 资源 ====================
 
     private final Cache blockCache;
     private final WriteBufferManager writeBufferManager;
     private final Env env;
 
-    /** Write thread pool: 16 threads for parallel putLightCurveBatch calls */
+    /** 写入线程池：16 线程并行写入 */
     private final ExecutorService writeThreadPool;
 
-    /** Distribution thread pool: 32 threads for healpix dispatch */
+    /** 分发线程池：32 线程并行分发 */
     private final ExecutorService distributionThreadPool;
-
-    /** Custom async flush pool for background SST ingest */
-    private final ExecutorService customAsyncFlushPool;
-    private final Semaphore flushConcurrencyLimiter;
 
     private RocksDBGlobalResourceManager(long cacheCapacity, long writeBufferCapacity) {
         RocksDB.loadLibrary();
@@ -60,21 +47,14 @@ public class RocksDBGlobalResourceManager implements AutoCloseable {
         this.writeBufferManager = new WriteBufferManager(writeBufferCapacity, blockCache);
 
         this.env = Env.getDefault();
-        this.env.setBackgroundThreads(8, Priority.HIGH);   // native flush threads
-        this.env.setBackgroundThreads(WRITE_THREADS, Priority.LOW); // native compaction threads
+        this.env.setBackgroundThreads(WRITE_THREADS, Priority.HIGH);
+        this.env.setBackgroundThreads(WRITE_THREADS, Priority.LOW);
 
-        // Write thread pool: 16 threads (aligned to TDengine NUM_THREADS)
         this.writeThreadPool = Executors.newFixedThreadPool(WRITE_THREADS,
                 new DaemonThreadFactory("RocksDB-Writer"));
 
-        // Distribution thread pool: 32 threads (aligned to TDengine NUM_VGROUPS)
         this.distributionThreadPool = Executors.newFixedThreadPool(DISTRIBUTION_PARALLELISM,
                 new DaemonThreadFactory("RocksDB-Distributor"));
-
-        // Async flush pool for background SST generation
-        this.customAsyncFlushPool = Executors.newFixedThreadPool(WRITE_THREADS,
-                new DaemonThreadFactory("RocksDB-Custom-Flush"));
-        this.flushConcurrencyLimiter = new Semaphore(8, true);
     }
 
     public static RocksDBGlobalResourceManager getInstance() {
@@ -82,8 +62,8 @@ public class RocksDBGlobalResourceManager implements AutoCloseable {
             synchronized (RocksDBGlobalResourceManager.class) {
                 if (instance == null) {
                     instance = new RocksDBGlobalResourceManager(
-                            100L * 1024 * 1024 * 1024,  // 100GB block cache
-                            20L * 1024 * 1024 * 1024     // 20GB write buffer budget
+                            100L * 1024 * 1024 * 1024,
+                            20L * 1024 * 1024 * 1024
                     );
                 }
             }
@@ -96,14 +76,11 @@ public class RocksDBGlobalResourceManager implements AutoCloseable {
     public Env getEnv() { return env; }
     public ExecutorService getWriteThreadPool() { return writeThreadPool; }
     public ExecutorService getDistributionThreadPool() { return distributionThreadPool; }
-    public ExecutorService getCustomAsyncFlushPool() { return customAsyncFlushPool; }
-    public Semaphore getFlushConcurrencyLimiter() { return flushConcurrencyLimiter; }
 
     @Override
     public void close() {
         shutdownPool(writeThreadPool, "WriteThreadPool");
         shutdownPool(distributionThreadPool, "DistributionThreadPool");
-        shutdownPool(customAsyncFlushPool, "CustomAsyncFlushPool");
         if (writeBufferManager != null) writeBufferManager.close();
         if (blockCache != null) blockCache.close();
         if (env != null) env.close();

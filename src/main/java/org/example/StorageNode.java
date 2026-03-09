@@ -161,42 +161,18 @@ public class StorageNode {
     }
 
     /**
-     * 批量处理数据写入
+     * 直接写入 LightCurvePoint 对象（跳过 CSV 解析）
+     * 由 MainNode Phase 2 优化路径调用
      */
-    public WriteResult processDataBatch(long healpixId, List<String> csvLines) {
-        long startTime = System.currentTimeMillis();
+    public int writePointsBatch(long healpixId, List<LightCurvePoint> points) {
         RocksDBServer dbService = healpixDatabases.get(healpixId);
-
-        if (dbService == null) {
-            return new WriteResult(0, csvLines.size(), System.currentTimeMillis() - startTime, false);
-        }
-
+        if (dbService == null) return 0;
         try {
-            List<RocksDBServer.LightCurvePoint> points = new ArrayList<>();
-            int parseErrors = 0;
-
-            for (String csvLine : csvLines) {
-                try {
-                    RocksDBServer.LightCurvePoint point = RocksDBServer.parseFromCSV(csvLine);
-                    points.add(point);
-                } catch (Exception e) {
-                    parseErrors++;
-                }
-            }
-
             dbService.putLightCurveBatch(points);
-            long duration = System.currentTimeMillis() - startTime;
-
-            // 更新统计
-            PerformanceStats stats = performanceStats.get("healpix_" + healpixId);
-            if (stats != null) {
-                stats.recordWrite(points.size(), duration);
-            }
-
-            return new WriteResult(points.size(), parseErrors, duration, true);
-
+            return points.size();
         } catch (Exception e) {
-            return new WriteResult(0, csvLines.size(), System.currentTimeMillis() - startTime, false);
+            System.err.println("writePointsBatch failed for healpix " + healpixId + ": " + e.getMessage());
+            return 0;
         }
     }
 
@@ -455,6 +431,25 @@ public class StorageNode {
                 dbService.forceFlush();
             } catch (Exception e) {
                 System.err.println("Error flushing database: " + e.getMessage());
+            }
+        }
+    }
+    public void forceFlushAllNoCompaction() {
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                dbService.forceFlushNoCompaction();
+            } catch (Exception e) {
+                System.err.println("Flush failed: " + e.getMessage());
+            }
+        }
+    }
+
+    public void compactOnly() {
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                dbService.compactOnly();
+            } catch (Exception e) {
+                System.err.println("Compact failed: " + e.getMessage());
             }
         }
     }
