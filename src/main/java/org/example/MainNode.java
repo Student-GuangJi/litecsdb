@@ -166,7 +166,6 @@ public class MainNode {
         final int numThreads = RocksDBGlobalResourceManager.WRITE_THREADS;
         final int batchSize = RocksDBGlobalResourceManager.BATCH_SIZE;
 
-        @SuppressWarnings("unchecked")
         List<Map.Entry<Long, List<LightCurvePoint>>>[] shards = new List[numThreads];
         for (int i = 0; i < numThreads; i++) shards[i] = new ArrayList<>();
 
@@ -325,6 +324,69 @@ public class MainNode {
 
     // ==================== Query methods (unchanged) ====================
 
+    /**
+     * STMK 分布式查询入口（论文 Algorithm 2 的完整实现）
+     *
+     * 查询谓词 Q(S, T, M, K) = (cone(ra,dec,radius), [startTime,endTime], [magMin,magMax], minObservations)
+     *
+     * 执行流程（严格对齐论文 Algorithm 2）：
+     *   1. MapRegionToCells: cone → HEALPix cell 集合
+     *   2. 对每个 cell 并行执行：精确空间剪枝 → 时间桶剪枝 → 精炼候选集
+     */
+    public DistributedQueryResult executeSTMKQuery(
+            double ra, double dec, double radius,
+            double startTime, double endTime,
+            String band, double magMin, double magMax, int minObservations) {
+        long queryStart = System.nanoTime();
+        try {
+            // Level 1: 空间剪枝 — MapRegionToCells
+            Set<Long> healpixIdsToQuery = calculateHealpixIdsInCone(ra, dec, radius);
+            if (healpixIdsToQuery.isEmpty()) {
+                return new DistributedQueryResult(Collections.emptySet(), 0,
+                        System.nanoTime() - queryStart, 0, 0);
+            }
+
+            Set<Long> allCandidates = new LinkedHashSet<>();
+            int nodesQueried = 0, nodesResponded = 0;
+            List<CompletableFuture<Set<Long>>> futures = new ArrayList<>();
+
+            for (Long healpixId : healpixIdsToQuery) {
+                StorageNode node = storageNodes.get((int) (healpixId % nodesCount));
+                if (node != null) {
+                    nodesQueried++;
+                    futures.add(CompletableFuture.supplyAsync(() -> {
+                        try {
+                            // 空间剪枝已在 StorageNode 内部完成（对齐论文 Algorithm 2）
+                            QueryResult nodeResult = node.executeSTMKQueryWithTimeBuckets(
+                                    healpixId, ra, dec, radius,
+                                    startTime, endTime, band,
+                                    magMin, magMax, minObservations);
+                            if (nodeResult != null && nodeResult.candidateObjects != null) {
+                                return nodeResult.candidateObjects;
+                            }
+                        } catch (Exception e) {
+                            System.err.println("STMK query failed on healpix " + healpixId + ": " + e.getMessage());
+                        }
+                        return Collections.<Long>emptySet();
+                    }));
+                }
+            }
+
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
+            for (CompletableFuture<Set<Long>> f : futures) {
+                Set<Long> c = f.get();
+                allCandidates.addAll(c);
+                if (!c.isEmpty()) nodesResponded++;
+            }
+
+            return new DistributedQueryResult(allCandidates, allCandidates.size(),
+                    System.nanoTime() - queryStart, nodesQueried, nodesResponded);
+        } catch (Exception e) {
+            return new DistributedQueryResult(Collections.emptySet(), 0,
+                    System.nanoTime() - queryStart, 0, 0);
+        }
+    }
+
     public DistributedQueryResult executeDistributedQueryWithTimeBuckets(
             double ra, double dec, double radius,
             double startTime, double endTime,
@@ -406,6 +468,73 @@ public class MainNode {
 
     public void buildAllTimeBucketsOffline() {
         storageNodes.parallelStream().forEach(StorageNode::buildAllTimeBucketsOffline);
+    }
+
+    /**
+     * 使用固定窗口离线构建时间桶索引（实验1对比基线）
+     */
+    public void buildAllTimeBucketsOfflineFixed(double deltaDays) {
+        storageNodes.parallelStream().forEach(node -> node.buildAllTimeBucketsOfflineFixed(deltaDays));
+    }
+
+    /**
+     * 获取时间桶索引的存储大小（字节）
+     */
+    public long getTimeBucketStorageSize() {
+        long total = 0;
+        for (StorageNode node : storageNodes) {
+            total += node.getTimeBucketStorageSize();
+        }
+        return total;
+    }
+
+    /**
+     * 收集详细的时间桶统计（含桶大小标准差）
+     * 通过 bucketSizeSqSum 计算，避免传递全量桶大小列表
+     */
+    public DetailedBucketStats collectDetailedTimeBucketStats() {
+        long totalBuckets = 0;
+        long totalObjects = 0;
+        double totalVarianceSum = 0;
+        long totalPointsInBuckets = 0;
+        long bucketCountForVariance = 0;
+        long bucketSizeSqSum = 0;
+
+        for (StorageNode node : storageNodes) {
+            Map<String, Object> nodeStats = node.getTimeBucketAggregateStats();
+            totalBuckets += (long) nodeStats.getOrDefault("totalBuckets", 0L);
+            totalObjects += (long) nodeStats.getOrDefault("totalObjects", 0L);
+            totalVarianceSum += (double) nodeStats.getOrDefault("totalVarianceSum", 0.0);
+            totalPointsInBuckets += (long) nodeStats.getOrDefault("totalPointsInBuckets", 0L);
+            bucketCountForVariance += (long) nodeStats.getOrDefault("bucketCountForVariance", 0L);
+            bucketSizeSqSum += (long) nodeStats.getOrDefault("bucketSizeSqSum", 0L);
+        }
+
+        DetailedBucketStats stats = new DetailedBucketStats();
+        stats.totalBuckets = totalBuckets;
+        stats.totalObjects = totalObjects;
+        stats.bucketsPerObject = totalObjects > 0 ? (double) totalBuckets / totalObjects : 0;
+        stats.avgBucketSize = totalBuckets > 0 ? (double) totalPointsInBuckets / totalBuckets : 0;
+        stats.avgIntraBucketVariance = bucketCountForVariance > 0 ? totalVarianceSum / bucketCountForVariance : 0;
+
+        // 桶大小标准差：Var = E[X^2] - E[X]^2
+        if (totalBuckets > 0) {
+            double meanSize = stats.avgBucketSize;
+            double meanSizeSq = (double) bucketSizeSqSum / totalBuckets;
+            stats.bucketSizeStdDev = Math.sqrt(Math.max(0, meanSizeSq - meanSize * meanSize));
+        }
+
+        return stats;
+    }
+
+    /** 详细桶统计（含桶大小标准差） */
+    public static class DetailedBucketStats {
+        public long totalBuckets;
+        public long totalObjects;
+        public double bucketsPerObject;
+        public double avgBucketSize;
+        public double avgIntraBucketVariance;
+        public double bucketSizeStdDev;
     }
 
     public long calculateHealpixId(double raDegrees, double decDegrees) {
@@ -568,5 +697,110 @@ public class MainNode {
         public double getAvgIndexTime() { return indexQueryTimes.stream().mapToDouble(Double::doubleValue).average().orElse(0); }
         public double getAvgScanTime() { return scanQueryTimes.stream().mapToDouble(Double::doubleValue).average().orElse(0); }
         public double getSpeedupRatio() { double s = getAvgScanTime(), i = getAvgIndexTime(); return s > 0 ? s / i : 0; }
+    }
+
+    // ==================== 以下方法需要添加到 MainNode.java ====================
+
+    /**
+     * 设置所有 HEALPix DB 的 DP 分桶参数
+     * 在 buildAllTimeBucketsOffline() 之前调用
+     */
+    public void setTimeBucketDPParams(double lambda, double storeCost) {
+        for (StorageNode node : storageNodes) {
+            node.setTimeBucketDPParams(lambda, storeCost);
+        }
+    }
+
+    /**
+     * STMK 查询 — 带详细剪枝/精炼统计
+     *
+     * 返回的 DetailedSTMKResult 包含每个天体的判定状态（CONFIRMED/PRUNED/AMBIGUOUS），
+     * 用于计算实验3中的剪枝率和精炼率。
+     */
+    public DetailedSTMKResult executeSTMKQueryDetailed(
+            double ra, double dec, double radius,
+            double startTime, double endTime,
+            String band, double magMin, double magMax, int minObservations) {
+
+        DetailedSTMKResult aggregated = new DetailedSTMKResult();
+
+        try {
+            Set<Long> healpixIdsToQuery = calculateHealpixIdsInCone(ra, dec, radius);
+            if (healpixIdsToQuery.isEmpty()) return aggregated;
+
+            List<CompletableFuture<DetailedSTMKResult>> futures = new ArrayList<>();
+
+            for (Long healpixId : healpixIdsToQuery) {
+                StorageNode node = storageNodes.get((int) (healpixId % nodesCount));
+                if (node == null) continue;
+
+                futures.add(CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return node.executeSTMKQueryDetailed(
+                                healpixId, ra, dec, radius,
+                                startTime, endTime, band,
+                                magMin, magMax, minObservations);
+                    } catch (Exception e) {
+                        return new DetailedSTMKResult();
+                    }
+                }));
+            }
+
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
+
+            for (CompletableFuture<DetailedSTMKResult> f : futures) {
+                DetailedSTMKResult partial = f.get();
+                aggregated.totalObjectsEvaluated += partial.totalObjectsEvaluated;
+                aggregated.confirmedCount += partial.confirmedCount;
+                aggregated.prunedCount += partial.prunedCount;
+                aggregated.ambiguousCount += partial.ambiguousCount;
+                aggregated.resultCount += partial.resultCount;
+            }
+        } catch (Exception e) {
+            System.err.println("DetailedSTMKQuery failed: " + e.getMessage());
+        }
+
+        return aggregated;
+    }
+
+    /**
+     * 收集全系统的时间桶统计信息
+     */
+    public Experiment3Runner.BucketStats collectTimeBucketStats() {
+        // 注意：这里引用了 Experiment3Runner.BucketStats，
+        // 实际实现中可以改为一个通用的内部类或直接返回 Map
+        long totalBuckets = 0;
+        long totalObjects = 0;
+        double totalVarianceSum = 0;
+        long totalPointsInBuckets = 0;
+        long bucketCountForVariance = 0;
+
+        for (StorageNode node : storageNodes) {
+            Map<String, Object> nodeStats = node.getTimeBucketAggregateStats();
+            totalBuckets += (long) nodeStats.getOrDefault("totalBuckets", 0L);
+            totalObjects += (long) nodeStats.getOrDefault("totalObjects", 0L);
+            totalVarianceSum += (double) nodeStats.getOrDefault("totalVarianceSum", 0.0);
+            totalPointsInBuckets += (long) nodeStats.getOrDefault("totalPointsInBuckets", 0L);
+            bucketCountForVariance += (long) nodeStats.getOrDefault("bucketCountForVariance", 0L);
+        }
+
+        Experiment3Runner.BucketStats stats = new Experiment3Runner.BucketStats();
+        stats.totalBuckets = totalBuckets;
+        stats.totalObjects = totalObjects;
+        stats.bucketsPerObject = totalObjects > 0 ? (double) totalBuckets / totalObjects : 0;
+        stats.avgBucketSize = totalBuckets > 0 ? (double) totalPointsInBuckets / totalBuckets : 0;
+        stats.avgIntraBucketVariance = bucketCountForVariance > 0 ? totalVarianceSum / bucketCountForVariance : 0;
+        return stats;
+    }
+
+    /**
+     * 详细 STMK 查询结果（含剪枝统计）
+     */
+    public static class DetailedSTMKResult {
+        public int totalObjectsEvaluated = 0;  // 空间过滤后的总天体数
+        public int confirmedCount = 0;          // 桶级直接确认
+        public int prunedCount = 0;             // 桶级直接剪枝
+        public int ambiguousCount = 0;          // 需要精炼
+        public int resultCount = 0;             // 最终结果数
     }
 }

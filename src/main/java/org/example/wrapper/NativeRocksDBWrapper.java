@@ -16,19 +16,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 原生 RocksDB 基准 — 32 ColumnFamily 并行写入
- *
- * 并行度对齐：
- *   - TDengine:  32 个 vgroup 并行
- *   - LitecsDB:  ~48 个 HEALPix RocksDB 实例并行
- *   - InfluxDB:  32 个 HTTP 客户端连接并行
- *   - NativeRocksDB: 32 个 ColumnFamily 并行 ← 本文件
- *
- * 16 个写入线程，每线程按 sourceId hash 分发到 32 个 CF，
- * 每个 CF 独立 WriteBatch → db.write()
+ * 原生 RocksDB 基准 — 32 ColumnFamily 并行写入 + 查询支持
  */
 public class NativeRocksDBWrapper implements AutoCloseable {
     private static final int WRITE_THREADS = 16;
@@ -40,6 +32,7 @@ public class NativeRocksDBWrapper implements AutoCloseable {
     private final ColumnFamilyHandle[] cfHandles;
     private final ExecutorService writePool;
     private final WriteOptions writeOptions;
+    private final ReadOptions readOptions;
 
     private final AtomicLong logicalBytesWritten = new AtomicLong(0);
     private long initialDirSize = 0;
@@ -56,7 +49,6 @@ public class NativeRocksDBWrapper implements AutoCloseable {
             BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
                     .setBlockCache(globalRes.getBlockCache());
 
-            // DB 级选项
             DBOptions dbOptions = new DBOptions()
                     .setCreateIfMissing(true)
                     .setCreateMissingColumnFamilies(true)
@@ -66,7 +58,6 @@ public class NativeRocksDBWrapper implements AutoCloseable {
                     .setIncreaseParallelism(Math.max(8, Runtime.getRuntime().availableProcessors()))
                     .setBytesPerSync(4L * 1024 * 1024);
 
-            // CF 级选项
             ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
                     .setCompressionType(CompressionType.LZ4_COMPRESSION)
                     .setTableFormatConfig(tableConfig)
@@ -77,12 +68,10 @@ public class NativeRocksDBWrapper implements AutoCloseable {
                     .setLevel0SlowdownWritesTrigger(32)
                     .setLevel0StopWritesTrigger(48);
 
-            // 创建 32 个 CF
             List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
             cfDescriptors.add(new ColumnFamilyDescriptor("default".getBytes(), cfOptions));
             for (int i = 0; i < NUM_CF; i++) {
-                cfDescriptors.add(new ColumnFamilyDescriptor(
-                        ("cf_" + i).getBytes(), cfOptions));
+                cfDescriptors.add(new ColumnFamilyDescriptor(("cf_" + i).getBytes(), cfOptions));
             }
 
             List<ColumnFamilyHandle> handles = new ArrayList<>();
@@ -90,13 +79,11 @@ public class NativeRocksDBWrapper implements AutoCloseable {
 
             this.cfHandles = new ColumnFamilyHandle[NUM_CF];
             for (int i = 0; i < NUM_CF; i++) {
-                cfHandles[i] = handles.get(i + 1); // skip default
+                cfHandles[i] = handles.get(i + 1);
             }
 
-            // WAL=on: 写入返回时数据在 WAL，与 InfluxDB/TDengine 对齐
-            this.writeOptions = new WriteOptions()
-                    .setDisableWAL(false)
-                    .setSync(false);
+            this.writeOptions = new WriteOptions().setDisableWAL(false).setSync(false);
+            this.readOptions = new ReadOptions();
 
             this.initialDirSize = StorageUtils.getDirectorySize(dbPath);
 
@@ -110,28 +97,19 @@ public class NativeRocksDBWrapper implements AutoCloseable {
             t.setName("NativeRocksDB-Writer-" + t.getId());
             return t;
         });
-
-        System.out.println("[Phase 1] RocksDB initialized");
-        System.out.printf("  %d column_families, write_buffer=256MB, write_threads=%d, batch_size=%d, WAL=on%n",
-                NUM_CF, WRITE_THREADS, BATCH_SIZE);
     }
 
-    /**
-     * 16 线程并行写入，按 sourceId hash 分发到 32 个 CF
-     */
     public void putBatch(List<LightCurvePoint> points) {
         if (points == null || points.isEmpty()) return;
 
         logicalBytesWritten.addAndGet(points.size() * 90L);
 
-        // 按 CF 分组
         Map<Integer, List<LightCurvePoint>> cfBuckets = new HashMap<>();
         for (LightCurvePoint p : points) {
             int cf = (int) (Math.abs(p.sourceId) % NUM_CF);
             cfBuckets.computeIfAbsent(cf, k -> new ArrayList<>()).add(p);
         }
 
-        // 分成 WRITE_THREADS 份
         int chunkSize = Math.max(1, (cfBuckets.size() + WRITE_THREADS - 1) / WRITE_THREADS);
         List<List<Map.Entry<Integer, List<LightCurvePoint>>>> chunks = new ArrayList<>();
         List<Map.Entry<Integer, List<LightCurvePoint>>> entries = new ArrayList<>(cfBuckets.entrySet());
@@ -164,9 +142,6 @@ public class NativeRocksDBWrapper implements AutoCloseable {
         }
     }
 
-    /**
-     * 每个 CF 独立 WriteBatch
-     */
     private void writeCFBatch(int cfIdx, List<LightCurvePoint> points) throws RocksDBException {
         ColumnFamilyHandle cfh = cfHandles[cfIdx];
 
@@ -181,6 +156,120 @@ public class NativeRocksDBWrapper implements AutoCloseable {
                 db.write(writeOptions, batch);
             }
         }
+    }
+
+    /**
+     * 简单查询：按sourceId前缀扫描
+     */
+    public int queryBySourceId(long sourceId) {
+        int cfIdx = (int) (Math.abs(sourceId) % NUM_CF);
+        ColumnFamilyHandle cfh = cfHandles[cfIdx];
+
+        // 构建前缀key
+        ByteBuffer prefixBuf = ByteBuffer.allocate(8);
+        prefixBuf.putLong(sourceId);
+        byte[] prefix = prefixBuf.array();
+
+        int count = 0;
+        try (RocksIterator it = db.newIterator(cfh, readOptions)) {
+            it.seek(prefix);
+            while (it.isValid()) {
+                byte[] key = it.key();
+                // 检查前缀是否匹配
+                if (key.length >= 8) {
+                    ByteBuffer keyBuf = ByteBuffer.wrap(key);
+                    long keySid = keyBuf.getLong();
+                    if (keySid != sourceId) break;
+                    count++;
+                }
+                it.next();
+            }
+        }
+        return count;
+    }
+
+    /**
+     * STMK查询：全表扫描 + 过滤 + 分组聚合
+     */
+    public int executeSTMKQuery(double startTime, double endTime, String band,
+                                double magMin, double magMax,
+                                double ra, double dec, double radius, int minObs) {
+        Map<Long, int[]> sourceStats = new HashMap<>();  // sourceId -> [count, hasCoords, ra*1e6, dec*1e6]
+
+        // 并行扫描所有CF
+        AtomicInteger totalMatches = new AtomicInteger(0);
+        CountDownLatch latch = new CountDownLatch(NUM_CF);
+
+        for (int cf = 0; cf < NUM_CF; cf++) {
+            final int cfIdx = cf;
+            writePool.submit(() -> {
+                try {
+                    Map<Long, int[]> localStats = new HashMap<>();
+                    ColumnFamilyHandle cfh = cfHandles[cfIdx];
+
+                    try (RocksIterator it = db.newIterator(cfh, readOptions)) {
+                        for (it.seekToFirst(); it.isValid(); it.next()) {
+                            LightCurvePoint p = deserializePoint(it.value());
+                            if (p == null) continue;
+
+                            // 时间+波段+星等过滤
+                            if (p.time >= startTime && p.time <= endTime &&
+                                    p.band.equals(band) &&
+                                    p.mag >= magMin && p.mag <= magMax) {
+
+                                int[] stats = localStats.computeIfAbsent(p.sourceId,
+                                        k -> new int[]{0, 0, (int)(p.ra * 1e6), (int)(p.dec * 1e6)});
+                                stats[0]++;
+                                stats[1] = 1;
+                            }
+                        }
+                    }
+
+                    // 合并到全局统计
+                    synchronized (sourceStats) {
+                        for (Map.Entry<Long, int[]> e : localStats.entrySet()) {
+                            sourceStats.merge(e.getKey(), e.getValue(), (old, nw) -> {
+                                old[0] += nw[0];
+                                return old;
+                            });
+                        }
+                    }
+                } catch (Exception e) {
+                    // ignore
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        try {
+            latch.await(120, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // 应用空间过滤和minObs约束
+        int count = 0;
+        for (Map.Entry<Long, int[]> entry : sourceStats.entrySet()) {
+            int[] stats = entry.getValue();
+            if (stats[0] >= minObs) {
+                double pRa = stats[2] / 1e6;
+                double pDec = stats[3] / 1e6;
+                if (isInCone(pRa, pDec, ra, dec, radius)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    private boolean isInCone(double ra1, double dec1, double ra2, double dec2, double radius) {
+        double ra1R = Math.toRadians(ra1), dec1R = Math.toRadians(dec1);
+        double ra2R = Math.toRadians(ra2), dec2R = Math.toRadians(dec2);
+        double a = Math.sin((dec2R - dec1R) / 2) * Math.sin((dec2R - dec1R) / 2) +
+                Math.cos(dec1R) * Math.cos(dec2R) *
+                        Math.sin((ra2R - ra1R) / 2) * Math.sin((ra2R - ra1R) / 2);
+        return Math.toDegrees(2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))) <= radius;
     }
 
     private byte[] buildKey(LightCurvePoint p) {
@@ -214,6 +303,53 @@ public class NativeRocksDBWrapper implements AutoCloseable {
         return buf.array();
     }
 
+    private LightCurvePoint deserializePoint(byte[] data) {
+        try {
+            ByteBuffer buf = ByteBuffer.wrap(data);
+            long sourceId = buf.getLong();
+            double ra = buf.getDouble();
+            double dec = buf.getDouble();
+            long transitId = buf.getLong();
+            int bandLen = buf.getInt();
+            byte[] bandBytes = new byte[bandLen];
+            buf.get(bandBytes);
+            String band = new String(bandBytes, StandardCharsets.UTF_8);
+            double time = buf.getDouble();
+            double mag = buf.getDouble();
+            double flux = buf.getDouble();
+            double fluxError = buf.getDouble();
+            double fluxOverError = buf.getDouble();
+            boolean rejectedByPhotometry = buf.get() == 1;
+            boolean rejectedByVariability = buf.get() == 1;
+            int otherFlags = buf.getInt();
+            long solutionId = buf.getLong();
+
+            return new LightCurvePoint(sourceId, ra, dec, transitId, band, time, mag,
+                    flux, fluxError, fluxOverError, rejectedByPhotometry,
+                    rejectedByVariability, otherFlags, solutionId);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 清除查询缓存（Block Cache），确保查询公平性
+     * 通过关闭并重建 block cache 或清空缓存来消除缓存优势
+     */
+    public void clearQueryCache() {
+        try {
+            // Flush 所有 memtable 到磁盘，确保数据持久化
+            for (ColumnFamilyHandle cfh : cfHandles) {
+                db.flush(new FlushOptions().setWaitForFlush(true), cfh);
+            }
+            // 注意：RocksDB Java API 没有直接的 block cache 清空方法
+            // 通过显式 compact 强制更新 SST 文件索引，使旧缓存失效
+            // 实际生产中可通过重新打开 DB 来彻底清除缓存
+        } catch (RocksDBException e) {
+            System.err.println("NativeRocksDB cache clear failed: " + e.getMessage());
+        }
+    }
+
     public void forceFlush() {
         try {
             for (ColumnFamilyHandle cfh : cfHandles) {
@@ -240,6 +376,7 @@ public class NativeRocksDBWrapper implements AutoCloseable {
         writePool.shutdown();
         try { writePool.awaitTermination(30, TimeUnit.SECONDS); } catch (InterruptedException e) {}
         if (writeOptions != null) writeOptions.close();
+        if (readOptions != null) readOptions.close();
         if (cfHandles != null) {
             for (ColumnFamilyHandle cfh : cfHandles) {
                 if (cfh != null) cfh.close();

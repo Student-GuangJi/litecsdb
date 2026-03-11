@@ -49,8 +49,8 @@ public class ParameterTuningBenchmark {
     static final boolean DEF_NO_WAL    = false;
 
     // =============== 实验控制 ===============
-    static final int REPS   = 10;
-    static final int WARMUP = 1;
+    static final int REPS   = 1;
+    static final int WARMUP = 0;
     static final String OUT_DIR = "experiment_results/";
     static final String TMP_DIR = "experiment_tmp/";
 
@@ -91,63 +91,63 @@ public class ParameterTuningBenchmark {
         execMainNode(baseline(), "BASELINE", "DEFAULT");
 
         // 实验 1: WRITE_THREADS
-        section("Exp 1/7: WRITE_THREADS");
-        for (int v : new int[]{1, 2, 4, 8, 16, 32}) {
-            Cfg c = baseline(); c.threads = v;
-            execMainNode(c, "WRITE_THREADS", String.valueOf(v));
-        }
+//        section("Exp 1/7: WRITE_THREADS");
+//        for (int v : new int[]{1, 2, 4, 8, 16, 32}) {
+//            Cfg c = baseline(); c.threads = v;
+//            execMainNode(c, "WRITE_THREADS", String.valueOf(v));
+//        }
 
         // 实验 2: BATCH_SIZE
-        section("Exp 2/7: BATCH_SIZE");
-        for (int v : new int[]{100, 500, 1_000, 5_000, 10_000, 50_000, 100_000}) {
-            Cfg c = baseline(); c.batch = v;
-            execMainNode(c, "BATCH_SIZE", String.valueOf(v));
-        }
+//        section("Exp 2/7: BATCH_SIZE");
+//        for (int v : new int[]{100, 500, 1_000, 5_000, 10_000, 50_000, 100_000}) {
+//            Cfg c = baseline(); c.batch = v;
+//            execMainNode(c, "BATCH_SIZE", String.valueOf(v));
+//        }
 
         // 实验 3: NODES_COUNT
-        section("Exp 3/7: NODES_COUNT");
-        for (int v : new int[]{1, 2, 4, 8, 16}) {
-            Cfg c = baseline(); c.nodes = v;
-            execMainNode(c, "NODES_COUNT", String.valueOf(v));
-        }
+//        section("Exp 3/7: NODES_COUNT");
+//        for (int v : new int[]{1, 2, 4, 8, 16}) {
+//            Cfg c = baseline(); c.nodes = v;
+//            execMainNode(c, "NODES_COUNT", String.valueOf(v));
+//        }
 
         // 实验 4: HEALPIX_LEVEL
         section("Exp 4/7: HEALPIX_LEVEL");
-        for (int v : new int[]{1, 2, 3}) {
+        for (int v : new int[]{5}) {
             Cfg c = baseline(); c.level = v;
             execMainNode(c, "HEALPIX_LEVEL", String.valueOf(v));
         }
 
         // 实验 5: WRITE_BUFFER_SIZE_MB（需要自定义 RocksDB 参数）
-        section("Exp 5/7: WRITE_BUFFER_SIZE_MB");
-        for (long v : new long[]{16, 64, 128, 256, 512}) {
-            Cfg c = baseline(); c.wbMB = v;
-            execNodeWriter(c, "WRITE_BUFFER_SIZE_MB", String.valueOf(v));
-        }
+//        section("Exp 5/7: WRITE_BUFFER_SIZE_MB");
+//        for (long v : new long[]{16, 64, 128, 256, 512}) {
+//            Cfg c = baseline(); c.wbMB = v;
+//            execNodeWriter(c, "WRITE_BUFFER_SIZE_MB", String.valueOf(v));
+//        }
 
         // 实验 6: WRITE_BUFFER_NUMBER
-        section("Exp 6/7: WRITE_BUFFER_NUM (max/minMerge)");
-        for (int[] p : new int[][]{{2, 1}, {4, 1}, {4, 2}, {6, 2}, {8, 2}, {8, 4}}) {
-            Cfg c = baseline(); c.maxWB = p[0]; c.minMerge = p[1];
-            execNodeWriter(c, "WRITE_BUFFER_NUM", p[0] + "/" + p[1]);
-        }
+//        section("Exp 6/7: WRITE_BUFFER_NUM (max/minMerge)");
+//        for (int[] p : new int[][]{{2, 1}, {4, 1}, {4, 2}, {6, 2}, {8, 2}, {8, 4}}) {
+//            Cfg c = baseline(); c.maxWB = p[0]; c.minMerge = p[1];
+//            execNodeWriter(c, "WRITE_BUFFER_NUM", p[0] + "/" + p[1]);
+//        }
 
         // 实验 7: WAL / Sync / Compression
-        section("Exp 7/7: WAL / Sync / Compression");
-        { Cfg c = baseline(); c.noWAL = false; c.sync = false;
-            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=ON,Sync=OFF,LZ4"); }
-        { Cfg c = baseline(); c.noWAL = true; c.sync = false;
-            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=OFF,Sync=OFF,LZ4"); }
-        { Cfg c = baseline(); c.noWAL = false; c.sync = true;
-            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=ON,Sync=ON,LZ4"); }
-        for (Object[] ct : new Object[][]{
-                {"NONE", CompressionType.NO_COMPRESSION},
-                {"SNAPPY", CompressionType.SNAPPY_COMPRESSION},
-                {"LZ4", CompressionType.LZ4_COMPRESSION},
-                {"ZSTD", CompressionType.ZSTD_COMPRESSION}}) {
-            Cfg c = baseline(); c.comp = (CompressionType) ct[1];
-            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=ON,Sync=OFF," + ct[0]);
-        }
+//        section("Exp 7/7: WAL / Sync / Compression");
+//        { Cfg c = baseline(); c.noWAL = false; c.sync = false;
+//            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=ON,Sync=OFF,LZ4"); }
+//        { Cfg c = baseline(); c.noWAL = true; c.sync = false;
+//            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=OFF,Sync=OFF,LZ4"); }
+//        { Cfg c = baseline(); c.noWAL = false; c.sync = true;
+//            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=ON,Sync=ON,LZ4"); }
+//        for (Object[] ct : new Object[][]{
+//                {"NONE", CompressionType.NO_COMPRESSION},
+//                {"SNAPPY", CompressionType.SNAPPY_COMPRESSION},
+//                {"LZ4", CompressionType.LZ4_COMPRESSION},
+//                {"ZSTD", CompressionType.ZSTD_COMPRESSION}}) {
+//            Cfg c = baseline(); c.comp = (CompressionType) ct[1];
+//            execNodeWriter(c, "WAL_SYNC_COMP", "WAL=ON,Sync=OFF," + ct[0]);
+//        }
 
         generateReport();
         System.out.println("\n✅ 全部实验完成！结果保存至 " + OUT_DIR);

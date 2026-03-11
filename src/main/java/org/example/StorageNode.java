@@ -139,6 +139,32 @@ public class StorageNode {
     }
 
     /**
+     * 使用固定时间窗口离线构建时间桶索引（实验1对比基线）
+     */
+    public void buildAllTimeBucketsOfflineFixed(double deltaDays) {
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                dbService.buildAllTimeBucketsOfflineFixed(deltaDays);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    /**
+     * 获取 time_buckets 列族的估计存储大小（字节）
+     */
+    public long getTimeBucketStorageSize() {
+        long total = 0;
+        for (RocksDBServer dbService : healpixDatabases.values()) {
+            try {
+                total += dbService.getTimeBucketStorageSize();
+            } catch (Exception e) { }
+        }
+        return total;
+    }
+
+    /**
      * 初始化HEALPix数据库
      */
     public boolean initializeHealpixDatabase(long healpixId, RocksDBServer.Config config) {
@@ -284,22 +310,6 @@ public class StorageNode {
             System.err.println("Failed to get star metadata for source " + sourceId +
                     " in HEALPix " + healpixId + ": " + e.getMessage());
             return null;
-        }
-    }
-
-    /**
-     * 批量获取天体元数据
-     */
-    public Map<Long, RocksDBServer.StarMetadata> getStarsMetadataBatch(long healpixId, Set<Long> sourceIds) {
-        RocksDBServer dbService = healpixDatabases.get(healpixId);
-        if (dbService == null) {
-            return Collections.emptyMap();
-        }
-        try {
-            return dbService.getStarsMetadataBatch(sourceIds);
-        } catch (Exception e) {
-            System.err.println("Failed to batch get star metadata in HEALPix " + healpixId + ": " + e.getMessage());
-            return Collections.emptyMap();
         }
     }
 
@@ -471,6 +481,17 @@ public class StorageNode {
         return new double[]{totalLogical, totalPhysical};
     }
 
+    private Map<Long, RocksDBServer.StarMetadata> getStarsMetadataBatch(
+            long healpixId, Set<Long> sourceIds) {
+        RocksDBServer dbService = healpixDatabases.get(healpixId);
+        if (dbService == null) return Collections.emptyMap();
+        try {
+            return dbService.getStarsMetadataBatch(sourceIds);
+        } catch (Exception e) {
+            return Collections.emptyMap();
+        }
+    }
+
     // ========== 内部类 ==========
 
     public static class WriteResult {
@@ -547,5 +568,194 @@ public class StorageNode {
             return stats;
         }
     }
-}
 
+    // ==================== 以下方法需要添加到 StorageNode.java ====================
+
+    /**
+     * 设置所有 HEALPix DB 的 DP 分桶参数
+     */
+    public void setTimeBucketDPParams(double lambda, double storeCost) {
+        for (Map.Entry<Long, RocksDBServer> entry : healpixDatabases.entrySet()) {
+            RocksDBServer server = entry.getValue();
+            server.getConfig().lambda = lambda;
+            server.getConfig().storeCost = storeCost;
+        }
+    }
+
+    /**
+     * STMK 详细查询：对指定 healpixId 内的天体执行 STMK 查询，
+     * 返回每个天体的判定状态用于统计剪枝率/精炼率
+     *
+     * 流程严格对齐论文 Algorithm 2:
+     *   1. 获取 cell 内所有天体
+     *   2. 精确空间过滤 InsideRegion
+     *   3. 遍历时间桶做双向剪枝
+     *   4. 精炼候选集
+     */
+    public MainNode.DetailedSTMKResult executeSTMKQueryDetailed(
+            long healpixId, double centerRa, double centerDec, double radius,
+            double startTime, double endTime, String band,
+            double magMin, double magMax, int minObservations) {
+
+        MainNode.DetailedSTMKResult result = new MainNode.DetailedSTMKResult();
+
+        RocksDBServer server = healpixDatabases.get(healpixId);
+        if (server == null) return result;
+
+        try {
+            // Level 2: 获取天区内所有天体
+            List<RocksDBServer.StarMetadata> allStars = server.getAllStarsMetadata();
+
+            for (RocksDBServer.StarMetadata star : allStars) {
+                // Level 1 精确空间剪枝
+                double dist = greatCircleDistance(centerRa, centerDec, star.ra, star.dec);
+                if (dist > radius) continue;
+
+                result.totalObjectsEvaluated++;
+
+                // Level 3: 时间桶剪枝查询
+                RocksDBServer.TimeBucketQueryResult tbResult =
+                        server.queryWithTimeBucketsSTMK(
+                                star.sourceId, band,
+                                startTime, endTime,
+                                magMin, magMax, minObservations);
+
+                switch (tbResult.status) {
+                    case "CONFIRMED":
+                        result.confirmedCount++;
+                        result.resultCount++;
+                        break;
+                    case "PRUNED":
+                        result.prunedCount++;
+                        break;
+                    case "AMBIGUOUS":
+                        result.ambiguousCount++;
+                        // 精炼：扫描黄桶
+                        int refinedCount = server.refineAmbiguousBucketsSTMK(
+                                star.sourceId, band,
+                                tbResult.ambiguousBuckets,
+                                startTime, endTime,
+                                magMin, magMax);
+                        int totalCount = tbResult.confirmedCount + refinedCount;
+                        if (totalCount >= minObservations) {
+                            result.resultCount++;
+                        }
+                        break;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("DetailedSTMK query failed on healpix " + healpixId + ": " + e.getMessage());
+        }
+
+        return result;
+    }
+
+    /**
+     * STMK 查询（对齐论文 Algorithm 2，返回候选集 + 元数据）
+     * 供 MainNode.executeSTMKQuery() 调用
+     *
+     * 严格按照论文 Algorithm 2 的执行顺序：
+     *   1. 获取 cell 内所有天体（Level 2）
+     *   2. 精确空间剪枝 InsideRegion（Level 1 精确过滤）
+     *   3. 时间桶剪枝 + 精炼（Level 3）
+     */
+    public QueryResult executeSTMKQueryWithTimeBuckets(
+            long healpixId, double centerRa, double centerDec, double radius,
+            double startTime, double endTime,
+            String band, double magMin, double magMax, int minObservations) {
+
+        long queryStart = System.nanoTime();
+        int queryId = queryCounter.incrementAndGet();
+        RocksDBServer server = healpixDatabases.get(healpixId);
+        if (server == null) {
+            return new QueryResult(Collections.emptySet(), new HashMap<>(), 0,System.nanoTime() - queryStart, queryId, "STMK");
+        }
+
+        try {
+            Set<Long> candidates = new LinkedHashSet<>();
+            Map<Long, RocksDBServer.StarMetadata> metadataMap = new HashMap<>();
+
+            List<RocksDBServer.StarMetadata> allStars = server.getAllStarsMetadata();
+
+            for (RocksDBServer.StarMetadata star : allStars) {
+                // 第一步：精确空间剪枝 InsideRegion(ra, dec, S)
+                double dist = greatCircleDistance(centerRa, centerDec, star.ra, star.dec);
+                if (dist > radius) continue;
+
+                metadataMap.put(star.sourceId, star);
+
+                // 第二步：时间桶剪枝
+                RocksDBServer.TimeBucketQueryResult tbResult =
+                        server.queryWithTimeBucketsSTMK(
+                                star.sourceId, band,
+                                startTime, endTime,
+                                magMin, magMax, minObservations);
+
+                switch (tbResult.status) {
+                    case "CONFIRMED":
+                        candidates.add(star.sourceId);
+                        break;
+                    case "PRUNED":
+                        break;
+                    case "AMBIGUOUS":
+                        // 第三步：精炼候选集
+                        int refinedCount = server.refineAmbiguousBucketsSTMK(
+                                star.sourceId, band,
+                                tbResult.ambiguousBuckets,
+                                startTime, endTime,
+                                magMin, magMax);
+                        if (tbResult.confirmedCount + refinedCount >= minObservations) {
+                            candidates.add(star.sourceId);
+                        }
+                        break;
+                }
+            }
+
+            return new QueryResult(candidates, metadataMap, 0,System.nanoTime() - queryStart, queryId, "STMK");
+        } catch (Exception e) {
+            return new QueryResult(Collections.emptySet(), new HashMap<>(), 0,System.nanoTime() - queryStart, queryId, "STMK");
+        }
+    }
+
+    /**
+     * 获取时间桶的聚合统计（供实验3统计用）
+     */
+    public Map<String, Object> getTimeBucketAggregateStats() {
+        Map<String, Object> stats = new HashMap<>();
+        long totalBuckets = 0;
+        Set<Long> objectIds = new HashSet<>();
+        double totalVarianceSum = 0;
+        long totalPointsInBuckets = 0;
+        long bucketCountForVariance = 0;
+        long bucketSizeSqSum = 0;
+
+        for (Map.Entry<Long, RocksDBServer> entry : healpixDatabases.entrySet()) {
+            RocksDBServer server = entry.getValue();
+            try {
+                Map<String, Object> serverStats = server.getTimeBucketAggregateStats();
+                totalBuckets += (long) serverStats.getOrDefault("totalBuckets", 0L);
+                objectIds.addAll((Set<Long>) serverStats.getOrDefault("objectIds", Collections.emptySet()));
+                totalVarianceSum += (double) serverStats.getOrDefault("totalVarianceSum", 0.0);
+                totalPointsInBuckets += (long) serverStats.getOrDefault("totalPointsInBuckets", 0L);
+                bucketCountForVariance += (long) serverStats.getOrDefault("bucketCountForVariance", 0L);
+                bucketSizeSqSum += (long) serverStats.getOrDefault("bucketSizeSqSum", 0L);
+            } catch (Exception e) { }
+        }
+
+        stats.put("totalBuckets", totalBuckets);
+        stats.put("totalObjects", (long) objectIds.size());
+        stats.put("totalVarianceSum", totalVarianceSum);
+        stats.put("totalPointsInBuckets", totalPointsInBuckets);
+        stats.put("bucketCountForVariance", bucketCountForVariance);
+        stats.put("bucketSizeSqSum", bucketSizeSqSum);
+        return stats;
+    }
+
+    private static double greatCircleDistance(double ra1, double dec1, double ra2, double dec2) {
+        double ra1R = Math.toRadians(ra1), dec1R = Math.toRadians(dec1);
+        double ra2R = Math.toRadians(ra2), dec2R = Math.toRadians(dec2);
+        double a = Math.sin((dec2R - dec1R) / 2) * Math.sin((dec2R - dec1R) / 2) +
+                Math.cos(dec1R) * Math.cos(dec2R) * Math.sin((ra2R - ra1R) / 2) * Math.sin((ra2R - ra1R) / 2);
+        return Math.toDegrees(2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+    }
+}
