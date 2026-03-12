@@ -2,7 +2,10 @@ package org.example;
 
 import org.example.MainNode.*;
 import org.example.RocksDBServer.LightCurvePoint;
+import org.example.wrapper.InfluxDBClientWrapper;
 import org.example.wrapper.NativeRocksDBWrapper;
+import org.example.wrapper.TDengineClientWrapper;
+import org.example.wrapper.TDengineClientWrapper;
 
 import java.io.*;
 import java.nio.file.*;
@@ -38,8 +41,10 @@ import java.util.stream.Collectors;
 public class Experiment9Runner {
 
     // ==================== 实验配置 ====================
-    private static final int SIMPLE_QUERY_COUNT = 100;
-    private static final int STMK_QUERY_COUNT = 10;
+    private static final int SIMPLE_QUERY_COUNT = 5;
+    private static final int STMK_QUERY_COUNT = 5;
+    private static final int MAX_PRINT_ROWS = 3;   // 简单查询最多打印前N行详细数据
+    private static final int MAX_PRINT_IDS = 10;    // STMK查询最多打印前N个source_id
     private static final int WARMUP_QUERIES = 3;        // 预热查询数（不计入结果）
     private static final int HEALPIX_LEVEL = 1;
     private static final int NODE_COUNT = 2;
@@ -51,9 +56,6 @@ public class Experiment9Runner {
     private static final String TDENGINE_PASSWORD = "taosdata";
 
     // InfluxDB
-    private static final String INFLUX_URL = "http://127.0.0.1:8086";
-    private static final String INFLUX_TOKEN = "wangxc";
-    private static final String INFLUX_ORG = "astro_research";
     private static final String INFLUX_BUCKET = "gaia_lightcurves";
 
     // GAIA 时间转换常量
@@ -244,15 +246,19 @@ public class Experiment9Runner {
                 long[] hpInfo = sourceToHealpix.get(sid);
 
                 long start = System.nanoTime();
-                List<LightCurvePoint> lc = Collections.emptyList();
+                List<LightCurvePoint> lc = new ArrayList<>();
                 if (hpInfo != null) {
-                    lc = mainNode.getLightCurve(hpInfo[0], sid, "G");
+                    // 查询全部波段（G/BP/RP）的所有属性
+                    for (String band : new String[]{"G", "BP", "RP"}) {
+                        lc.addAll(mainNode.getLightCurve(hpInfo[0], sid, band));
+                    }
                 }
                 double latency = (System.nanoTime() - start) / 1_000_000.0;
 
                 if (i >= WARMUP_QUERIES) {
                     simpleLats.add(latency);
                     totalPoints += lc.size();
+                    logSimpleQueryDetail("LitecsDB", i - WARMUP_QUERIES, sid, lc, latency);
                 }
             }
             logSimpleResults("LitecsDB", simpleLats,
@@ -275,6 +281,8 @@ public class Experiment9Runner {
                 if (i >= WARMUP_QUERIES) {
                     stmkLats.add(latency);
                     stmkCounts.add(result.candidateCount);
+                    List<Long> matchedIds = new ArrayList<>(result.candidateObjects);
+                    logSTMKQueryDetail("LitecsDB", i - WARMUP_QUERIES, q, matchedIds, latency);
                 }
             }
             logSTMKResults("LitecsDB", stmkLats, stmkCounts);
@@ -287,46 +295,16 @@ public class Experiment9Runner {
         }
     }
 
-    // ==================== TDengine 测试（多线程优化） ====================
+    // ==================== TDengine 测试 ====================
     private void testTDengine() {
         log("\n" + "=".repeat(60));
-        log("Testing TDengine (multi-threaded)");
+        log("Testing TDengine (HEALPix supertable + TAG-based query)");
         log("=".repeat(60));
 
-        Connection conn = null;
-        // 用于并行查询的连接池
-        final int QUERY_THREADS = 8;
-        Connection[] queryConns = new Connection[QUERY_THREADS];
-        ExecutorService queryPool = Executors.newFixedThreadPool(QUERY_THREADS, r -> {
-            Thread t = new Thread(r);
-            t.setDaemon(true);
-            t.setName("TDengine-Query-" + t.getId());
-            return t;
-        });
-
+        TDengineClientWrapper tdengine = null;
         try {
-            conn = DriverManager.getConnection(
-                    "jdbc:TAOS://127.0.0.1:6030/?charset=UTF-8",
-                    TDENGINE_USER, TDENGINE_PASSWORD);
-
-            String dbName = findTDengineDatabase(conn);
-            if (dbName == null) {
-                log("[ERROR] No TDengine database found");
-                return;
-            }
-            log("  Using database: " + dbName);
-
-            // 创建查询线程的独立连接
-            for (int i = 0; i < QUERY_THREADS; i++) {
-                queryConns[i] = DriverManager.getConnection(
-                        "jdbc:TAOS://127.0.0.1:6030/?charset=UTF-8",
-                        TDENGINE_USER, TDENGINE_PASSWORD);
-                queryConns[i].createStatement().execute("USE " + dbName);
-            }
-            log("  Created " + QUERY_THREADS + " parallel query connections");
-
-            // 清除缓存
-            clearTDengineCache(conn);
+            tdengine = new TDengineClientWrapper(findTDengineDbName());
+            tdengine.clearQueryCache();
 
             // === 简单查询测试 ===
             log("  Running simple queries...");
@@ -334,42 +312,40 @@ public class Experiment9Runner {
             int totalPoints = 0;
 
             for (int i = 0; i < simpleQuerySourceIds.size(); i++) {
-                // 每次查询前重置连接状态（避免 JDBC 语句缓存）
                 long sid = simpleQuerySourceIds.get(i);
                 long start = System.nanoTime();
-                int count = executeTDengineSimpleQuery(conn, dbName, sid);
+                List<LightCurvePoint> rows = tdengine.executeSimpleQuery(sid);
                 double latency = (System.nanoTime() - start) / 1_000_000.0;
 
                 if (i >= WARMUP_QUERIES) {
                     simpleLats.add(latency);
-                    totalPoints += count;
+                    totalPoints += rows.size();
+                    logSimpleQueryDetail("TDengine", i - WARMUP_QUERIES, sid, rows, latency);
                 }
             }
             logSimpleResults("TDengine", simpleLats,
                     simpleLats.isEmpty() ? 0 : totalPoints / simpleLats.size());
 
-            // === STMK查询测试（多线程并行） ===
-            log("  Running STMK queries (multi-threaded)...");
-            clearTDengineCache(conn);
-
+            // === STMK 查询测试 ===
+            log("  Running STMK queries (HEALPix-pruned)...");
+            tdengine.clearQueryCache();
             List<Double> stmkLats = new ArrayList<>();
             List<Integer> stmkCounts = new ArrayList<>();
 
             for (int i = 0; i < stmkParams.size(); i++) {
                 STMKQueryParams q = stmkParams.get(i);
-
-                // 清除缓存
-                clearTDengineCache(conn);
+                tdengine.clearQueryCache();
 
                 long start = System.nanoTime();
-                int count = executeTDengineSTMKQueryParallel(queryConns, queryPool,
-                        QUERY_THREADS, dbName, q);
+                List<Long> matchedIds = tdengine.executeSTMKQuery(
+                        q.ra, q.dec, q.radius, q.startTime, q.endTime,
+                        q.magMin, q.magMax, q.minObs);
                 double latency = (System.nanoTime() - start) / 1_000_000.0;
 
                 if (i >= WARMUP_QUERIES) {
                     stmkLats.add(latency);
-                    stmkCounts.add(count);
-                    log(String.format("    STMK[%d]: %.2fms, results=%d", i - WARMUP_QUERIES, latency, count));
+                    stmkCounts.add(matchedIds.size());
+                    logSTMKQueryDetail("TDengine", i - WARMUP_QUERIES, q, matchedIds, latency);
                 }
             }
             logSTMKResults("TDengine", stmkLats, stmkCounts);
@@ -378,183 +354,37 @@ public class Experiment9Runner {
             log("[ERROR] TDengine test failed: " + e.getMessage());
             e.printStackTrace();
         } finally {
-            queryPool.shutdown();
-            try { queryPool.awaitTermination(30, TimeUnit.SECONDS); } catch (InterruptedException e) {}
-            for (Connection qc : queryConns) {
-                try { if (qc != null) qc.close(); } catch (Exception e) {}
-            }
-            try { if (conn != null) conn.close(); } catch (Exception e) {}
+            if (tdengine != null) tdengine.close();
         }
     }
 
-    /**
-     * 清除 TDengine 查询缓存
-     */
-    private void clearTDengineCache(Connection conn) {
-        try (Statement stmt = conn.createStatement()) {
-            stmt.execute("RESET QUERY CACHE");
-        } catch (Exception e) {
-            // 某些版本不支持，忽略
-        }
-    }
-
-    /**
-     * TDengine 简单查询 — 直接访问 per-source 子表
-     * DataManager 使用 s_{sourceId} 命名子表，TAG 含 source_id/ra/dec_val
-     */
-    private int executeTDengineSimpleQuery(Connection conn, String dbName, long sourceId) {
-        // 优先尝试 per-source 子表直接访问（O(1) 定位）
-        String sql = String.format(
-                "SELECT ts, mag, flux FROM %s.s_%d ORDER BY ts",
-                dbName, sourceId);
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            int count = 0;
-            while (rs.next()) count++;
-            return count;
-        } catch (SQLException e) {
-            // 回退到 TAG 过滤查询（兼容旧 hash 分桶模式）
-            String fallbackSql = String.format(
-                    "SELECT ts, mag, flux FROM %s.lightcurve WHERE source_id = %d ORDER BY ts",
-                    dbName, sourceId);
-            try (Statement stmt2 = conn.createStatement();
-                 ResultSet rs2 = stmt2.executeQuery(fallbackSql)) {
-                int count = 0;
-                while (rs2.next()) count++;
-                return count;
-            } catch (SQLException e2) {
-                return 0;
-            }
-        }
-    }
-
-    /**
-     * TDengine STMK 多线程并行查询（per-source 子表模式）
-     *
-     * 策略：使用超级表级别查询 + PARTITION BY TBNAME，
-     * TDengine 内部通过 vgroups 自动并行化。
-     * 外部通过多连接分段执行时间范围查询增强并行度。
-     *
-     * 查询结果直接包含 TAG 值 (source_id, ra, dec_val)，
-     * 无需二次坐标查询。
-     *
-     * SQL:
-     *   SELECT source_id, ra, dec_val, COUNT(*) as cnt
-     *   FROM {db}.lightcurve
-     *   WHERE ts >= {startUs} AND ts <= {endUs}
-     *     AND band = '{band}' AND mag >= {magMin} AND mag <= {magMax}
-     *   PARTITION BY TBNAME
-     *   HAVING COUNT(*) >= {minObs}
-     */
-    private int executeTDengineSTMKQueryParallel(Connection[] queryConns,
-                                                 ExecutorService queryPool,
-                                                 int numThreads,
-                                                 String dbName,
-                                                 STMKQueryParams q) {
-        long startUs = (GAIA_EPOCH_UNIX_MS + (long) (q.startTime * MS_PER_DAY)) * 1000;
-        long endUs = (GAIA_EPOCH_UNIX_MS + (long) (q.endTime * MS_PER_DAY)) * 1000;
-        long totalRange = endUs - startUs;
-
-        if (totalRange <= 0) return 0;
-
-        // 按时间范围分片到多个线程（利用 TDengine 的时间索引）
-        long shardSize = (totalRange + numThreads - 1) / numThreads;
-
-        // 每个线程收集 (source_id -> partial_count, ra, dec)
-        @SuppressWarnings("unchecked")
-        Map<Long, double[]>[] shardResults = new Map[numThreads];
-        for (int i = 0; i < numThreads; i++) {
-            shardResults[i] = new HashMap<>();
-        }
-
-        CountDownLatch latch = new CountDownLatch(numThreads);
-
-        for (int t = 0; t < numThreads; t++) {
-            final int threadIdx = t;
-            final long shardStart = startUs + t * shardSize;
-            final long shardEnd = Math.min(shardStart + shardSize, endUs);
-
-            queryPool.submit(() -> {
-                try {
-                    Connection threadConn = queryConns[threadIdx];
-
-                    // 分片查询：每个线程负责一段时间范围
-                    // PARTITION BY TBNAME 自动按子表分组，TAG 直接返回
-                    String sql = String.format(Locale.US,
-                            "SELECT source_id, ra, dec_val, COUNT(*) as cnt " +
-                                    "FROM %s.lightcurve " +
-                                    "WHERE ts >= %d AND ts <= %d AND band = '%s' " +
-                                    "AND mag >= %f AND mag <= %f " +
-                                    "PARTITION BY TBNAME",
-                            dbName, shardStart, shardEnd, q.band, q.magMin, q.magMax);
-
-                    try (Statement stmt = threadConn.createStatement();
-                         ResultSet rs = stmt.executeQuery(sql)) {
-                        while (rs.next()) {
-                            long sourceId = rs.getLong("source_id");
-                            double ra = rs.getDouble("ra");
-                            double decVal = rs.getDouble("dec_val");
-                            long cnt = rs.getLong("cnt");
-
-                            // 存储: [count, ra, dec]
-                            shardResults[threadIdx].merge(sourceId,
-                                    new double[]{cnt, ra, decVal},
-                                    (old, nw) -> {
-                                        old[0] += nw[0];
-                                        return old;
-                                    });
-                        }
-                    }
-                } catch (Exception e) {
-                    System.err.println("TDengine STMK thread " + threadIdx + " failed: " + e.getMessage());
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
-
-        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-
-        // 合并所有分片结果
-        Map<Long, double[]> globalCounts = new HashMap<>();
-        for (Map<Long, double[]> shard : shardResults) {
-            for (Map.Entry<Long, double[]> entry : shard.entrySet()) {
-                globalCounts.merge(entry.getKey(), entry.getValue(),
-                        (old, nw) -> {
-                            old[0] += nw[0];
-                            return old;
-                        });
-            }
-        }
-
-        // 过滤: minObs + 空间 cone search
-        int count = 0;
-        for (Map.Entry<Long, double[]> entry : globalCounts.entrySet()) {
-            double[] vals = entry.getValue();
-            if (vals[0] >= q.minObs) {
-                if (isInCone(vals[1], vals[2], q.ra, q.dec, q.radius)) {
-                    count++;
+    /** 查找已存在的 TDengine 数据库名 */
+    private String findTDengineDbName() {
+        try {
+            Connection conn = DriverManager.getConnection(
+                    "jdbc:TAOS://127.0.0.1:6030/?charset=UTF-8", TDENGINE_USER, TDENGINE_PASSWORD);
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SHOW DATABASES")) {
+                while (rs.next()) {
+                    String name = rs.getString(1);
+                    if (name.startsWith("astro_exp9")) { conn.close(); return name; }
                 }
             }
-        }
-        return count;
+            conn.close();
+        } catch (Exception e) { /* ignore */ }
+        return "astro_exp9";
     }
 
-    // ==================== InfluxDB 测试（多线程优化） ====================
+    // ==================== InfluxDB 测试 ====================
     private void testInfluxDB() {
         log("\n" + "=".repeat(60));
-        log("Testing InfluxDB (multi-threaded)");
+        log("Testing InfluxDB (HEALPix measurement + tag-based query)");
         log("=".repeat(60));
 
-        final int QUERY_THREADS = 8;
-        ExecutorService queryPool = Executors.newFixedThreadPool(QUERY_THREADS, r -> {
-            Thread t = new Thread(r);
-            t.setDaemon(true);
-            t.setName("InfluxDB-Query-" + t.getId());
-            return t;
-        });
-
+        InfluxDBClientWrapper influx = null;
         try {
+            influx = new InfluxDBClientWrapper(INFLUX_BUCKET);
+
             // === 简单查询测试 ===
             log("  Running simple queries...");
             List<Double> simpleLats = new ArrayList<>();
@@ -563,19 +393,29 @@ public class Experiment9Runner {
             for (int i = 0; i < simpleQuerySourceIds.size(); i++) {
                 long sid = simpleQuerySourceIds.get(i);
                 long start = System.nanoTime();
-                int count = executeInfluxSimpleQuery(sid);
+                List<String> rows = influx.executeSimpleQuery(sid);
                 double latency = (System.nanoTime() - start) / 1_000_000.0;
 
                 if (i >= WARMUP_QUERIES) {
                     simpleLats.add(latency);
-                    totalPoints += count;
+                    totalPoints += rows.size();
+                    log(String.format("    [Simple-%d] REQUEST:  sourceId=%d", i - WARMUP_QUERIES, sid));
+                    log(String.format("    [Simple-%d] RESPONSE: %d rows, latency=%.3fms",
+                            i - WARMUP_QUERIES, rows.size(), latency));
+                    int printCount = Math.min(rows.size(), MAX_PRINT_ROWS);
+                    for (int r = 0; r < printCount; r++) {
+                        log("      Row " + (r + 1) + ": " + rows.get(r));
+                    }
+                    if (rows.size() > MAX_PRINT_ROWS) {
+                        log("      ... (" + (rows.size() - MAX_PRINT_ROWS) + " more rows omitted)");
+                    }
                 }
             }
             logSimpleResults("InfluxDB", simpleLats,
                     simpleLats.isEmpty() ? 0 : totalPoints / simpleLats.size());
 
-            // === STMK查询测试（多线程并行） ===
-            log("  Running STMK queries (multi-threaded)...");
+            // === STMK 查询测试 ===
+            log("  Running STMK queries (HEALPix-pruned)...");
             List<Double> stmkLats = new ArrayList<>();
             List<Integer> stmkCounts = new ArrayList<>();
 
@@ -583,13 +423,15 @@ public class Experiment9Runner {
                 STMKQueryParams q = stmkParams.get(i);
 
                 long start = System.nanoTime();
-                int count = executeInfluxSTMKQueryParallel(queryPool, QUERY_THREADS, q);
+                List<Long> matchedIds = influx.executeSTMKQuery(
+                        q.ra, q.dec, q.radius, q.startTime, q.endTime,
+                        q.magMin, q.magMax, q.minObs);
                 double latency = (System.nanoTime() - start) / 1_000_000.0;
 
                 if (i >= WARMUP_QUERIES) {
                     stmkLats.add(latency);
-                    stmkCounts.add(count);
-                    log(String.format("    STMK[%d]: %.2fms, results=%d", i - WARMUP_QUERIES, latency, count));
+                    stmkCounts.add(matchedIds.size());
+                    logSTMKQueryDetail("InfluxDB", i - WARMUP_QUERIES, q, matchedIds, latency);
                 }
             }
             logSTMKResults("InfluxDB", stmkLats, stmkCounts);
@@ -598,290 +440,7 @@ public class Experiment9Runner {
             log("[ERROR] InfluxDB test failed: " + e.getMessage());
             e.printStackTrace();
         } finally {
-            queryPool.shutdown();
-            try { queryPool.awaitTermination(30, TimeUnit.SECONDS); } catch (InterruptedException e) {}
-        }
-    }
-
-    private int executeInfluxSimpleQuery(long sourceId) {
-        String flux = String.format(
-                "from(bucket: \"%s\") " +
-                        "|> range(start: 0) " +
-                        "|> filter(fn: (r) => r.source_id == \"%d\") " +
-                        "|> filter(fn: (r) => r._field == \"mag\")",
-                INFLUX_BUCKET, sourceId);
-        return executeFluxQuery(flux);
-    }
-
-    /**
-     * InfluxDB STMK 多线程并行查询
-     *
-     * 策略：将时间范围分成 N 段，每段由一个线程查询 Flux，
-     * 合并分片结果后重新聚合 count，过滤 minObs，最后空间过滤。
-     *
-     * Flux 等价：
-     *   from(bucket) |> range(start, stop)
-     *   |> filter(measurement == "lightcurve" and band == X and _field == "mag")
-     *   |> filter(_value >= magMin and _value <= magMax)
-     *   |> group(columns: ["source_id"])
-     *   |> count()
-     */
-    private int executeInfluxSTMKQueryParallel(ExecutorService queryPool, int numThreads,
-                                               STMKQueryParams q) {
-        long startMs = GAIA_EPOCH_UNIX_MS + (long) (q.startTime * MS_PER_DAY);
-        long endMs = GAIA_EPOCH_UNIX_MS + (long) (q.endTime * MS_PER_DAY);
-        long totalRange = endMs - startMs;
-
-        if (totalRange <= 0) return 0;
-
-        // 分成 numThreads 个时间段
-        long shardSize = (totalRange + numThreads - 1) / numThreads;
-
-        // 每个线程收集 source_id -> partial count
-        @SuppressWarnings("unchecked")
-        Map<String, Integer>[] shardResults = new Map[numThreads];
-        for (int i = 0; i < numThreads; i++) {
-            shardResults[i] = new HashMap<>();
-        }
-
-        CountDownLatch latch = new CountDownLatch(numThreads);
-
-        for (int s = 0; s < numThreads; s++) {
-            final int shardIdx = s;
-            final long shardStart = startMs + s * shardSize;
-            final long shardEnd = Math.min(shardStart + shardSize, endMs);
-
-            queryPool.submit(() -> {
-                try {
-                    String flux = String.format(Locale.US,
-                            "from(bucket: \"%s\") " +
-                                    "|> range(start: %d, stop: %d) " +
-                                    "|> filter(fn: (r) => r._measurement == \"lightcurve\" and r.band == \"%s\" and r._field == \"mag\") " +
-                                    "|> filter(fn: (r) => r._value >= %f and r._value <= %f) " +
-                                    "|> group(columns: [\"source_id\"]) " +
-                                    "|> count()",
-                            INFLUX_BUCKET, shardStart, shardEnd, q.band, q.magMin, q.magMax);
-
-                    shardResults[shardIdx] = executeFluxQueryGetCounts(flux);
-                } catch (Exception e) {
-                    System.err.println("InfluxDB STMK shard " + shardIdx + " failed: " + e.getMessage());
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
-
-        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-
-        // 合并各分片的计数
-        Map<String, Integer> globalCounts = new HashMap<>();
-        for (Map<String, Integer> shard : shardResults) {
-            for (Map.Entry<String, Integer> entry : shard.entrySet()) {
-                globalCounts.merge(entry.getKey(), entry.getValue(), Integer::sum);
-            }
-        }
-
-        // 过滤满足 minObs 的 source_id
-        List<Long> candidateSourceIds = new ArrayList<>();
-        for (Map.Entry<String, Integer> entry : globalCounts.entrySet()) {
-            if (entry.getValue() >= q.minObs) {
-                try {
-                    candidateSourceIds.add(Long.parseLong(entry.getKey()));
-                } catch (NumberFormatException e) {
-                    // ignore
-                }
-            }
-        }
-
-        if (candidateSourceIds.isEmpty()) return 0;
-
-        // 应用层空间过滤：获取 ra/dec 后做 cone search
-        AtomicInteger spatialCount = new AtomicInteger(0);
-        CountDownLatch spatialLatch = new CountDownLatch(candidateSourceIds.size());
-
-        for (long sourceId : candidateSourceIds) {
-            queryPool.submit(() -> {
-                try {
-                    double[] coord = getInfluxSourceCoord(sourceId);
-                    if (coord != null && isInCone(coord[0], coord[1], q.ra, q.dec, q.radius)) {
-                        spatialCount.incrementAndGet();
-                    }
-                } catch (Exception e) {
-                    // ignore
-                } finally {
-                    spatialLatch.countDown();
-                }
-            });
-        }
-
-        try { spatialLatch.await(120, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        return spatialCount.get();
-    }
-
-    /**
-     * 从 InfluxDB 获取 source_id 的 ra/dec 坐标
-     */
-    private double[] getInfluxSourceCoord(long sourceId) {
-        String fluxRa = String.format(
-                "from(bucket: \"%s\") |> range(start: 0) " +
-                        "|> filter(fn: (r) => r.source_id == \"%d\" and r._field == \"ra\") " +
-                        "|> first()",
-                INFLUX_BUCKET, sourceId);
-
-        String fluxDec = String.format(
-                "from(bucket: \"%s\") |> range(start: 0) " +
-                        "|> filter(fn: (r) => r.source_id == \"%d\" and r._field == \"dec\") " +
-                        "|> first()",
-                INFLUX_BUCKET, sourceId);
-
-        double ra = executeFluxQueryGetFirstValue(fluxRa);
-        double dec = executeFluxQueryGetFirstValue(fluxDec);
-
-        if (!Double.isNaN(ra) && !Double.isNaN(dec)) {
-            return new double[]{ra, dec};
-        }
-        return null;
-    }
-
-    /**
-     * 执行 Flux 查询返回第一个数值
-     */
-    private double executeFluxQueryGetFirstValue(String flux) {
-        try {
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
-                    new java.net.URL(INFLUX_URL + "/api/v2/query?org=" + INFLUX_ORG).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + INFLUX_TOKEN);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(60000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
-            }
-
-            if (conn.getResponseCode() != 200) return Double.NaN;
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith(",")) {
-                        String[] parts = line.split(",");
-                        // CSV annotated format: 最后几列通常是 _value
-                        for (int p = parts.length - 1; p >= 0; p--) {
-                            try {
-                                return Double.parseDouble(parts[p].trim());
-                            } catch (NumberFormatException e) {
-                                // try next column
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            // ignore
-        }
-        return Double.NaN;
-    }
-
-    /**
-     * 执行 Flux 查询返回 source_id -> count 映射
-     */
-    private Map<String, Integer> executeFluxQueryGetCounts(String flux) {
-        Map<String, Integer> counts = new HashMap<>();
-        try {
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
-                    new java.net.URL(INFLUX_URL + "/api/v2/query?org=" + INFLUX_ORG).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + INFLUX_TOKEN);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(120000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
-            }
-
-            if (conn.getResponseCode() != 200) return counts;
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                String headerLine = null;
-                int sourceIdColIdx = -1;
-                int valueColIdx = -1;
-
-                while ((line = reader.readLine()) != null) {
-                    if (line.isEmpty()) {
-                        // 新表开始，重置表头
-                        headerLine = null;
-                        sourceIdColIdx = -1;
-                        valueColIdx = -1;
-                        continue;
-                    }
-                    if (line.startsWith("#")) continue;
-
-                    if (headerLine == null) {
-                        headerLine = line;
-                        String[] headers = line.split(",");
-                        for (int i = 0; i < headers.length; i++) {
-                            String h = headers[i].trim();
-                            if (h.equals("source_id")) sourceIdColIdx = i;
-                            if (h.equals("_value")) valueColIdx = i;
-                        }
-                        continue;
-                    }
-
-                    if (sourceIdColIdx >= 0 && valueColIdx >= 0) {
-                        String[] parts = line.split(",");
-                        if (parts.length > Math.max(sourceIdColIdx, valueColIdx)) {
-                            try {
-                                String sid = parts[sourceIdColIdx].trim();
-                                int cnt = (int) Double.parseDouble(parts[valueColIdx].trim());
-                                counts.merge(sid, cnt, Integer::sum);
-                            } catch (NumberFormatException e) {
-                                // ignore
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            System.err.println("InfluxDB Flux count query failed: " + e.getMessage());
-        }
-        return counts;
-    }
-
-    private int executeFluxQuery(String flux) {
-        try {
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
-                    new java.net.URL(INFLUX_URL + "/api/v2/query?org=" + INFLUX_ORG).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + INFLUX_TOKEN);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(60000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
-            }
-
-            if (conn.getResponseCode() != 200) return 0;
-
-            int count = 0;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith(",")) {
-                        count++;
-                    }
-                }
-            }
-            return Math.max(0, count - 1);
-        } catch (Exception e) {
-            return 0;
+            if (influx != null) influx.close();
         }
     }
 
@@ -905,6 +464,7 @@ public class Experiment9Runner {
             rocksdb = new NativeRocksDBWrapper(dbPath);
 
             // === 简单查询测试 ===
+            // NativeRocksDB 通过前缀扫描返回全部数据，queryBySourceId 内部读取所有列
             log("  Running simple queries...");
             List<Double> simpleLats = new ArrayList<>();
             int totalPoints = 0;
@@ -918,6 +478,9 @@ public class Experiment9Runner {
                 if (i >= WARMUP_QUERIES) {
                     simpleLats.add(latency);
                     totalPoints += count;
+                    log(String.format("    [Simple-%d] REQUEST:  sourceId=%d", i - WARMUP_QUERIES, sid));
+                    log(String.format("    [Simple-%d] RESPONSE: %d rows (all columns scanned via prefix seek), latency=%.3fms",
+                            i - WARMUP_QUERIES, count, latency));
                 }
             }
             logSimpleResults("NativeRocksDB", simpleLats,
@@ -938,7 +501,13 @@ public class Experiment9Runner {
                 if (i >= WARMUP_QUERIES) {
                     stmkLats.add(latency);
                     stmkCounts.add(count);
-                    log(String.format("    STMK[%d]: %.2fms, results=%d", i - WARMUP_QUERIES, latency, count));
+                    log(String.format(Locale.US,
+                            "    [STMK-%d] REQUEST:  ra=%.4f, dec=%.4f, radius=%.2f sq.deg, " +
+                                    "t_min=%.2f, t_max=%.2f, mag_min=%.4f, mag_max=%.4f, count=%d",
+                            i - WARMUP_QUERIES, q.ra, q.dec, q.radius,
+                            q.startTime, q.endTime, q.magMin, q.magMax, q.minObs));
+                    log(String.format("    [STMK-%d] RESPONSE: %d source_ids matched (full scan + app-level filter), latency=%.2fms",
+                            i - WARMUP_QUERIES, count, latency));
                 }
             }
             logSTMKResults("NativeRocksDB", stmkLats, stmkCounts);
@@ -948,6 +517,58 @@ public class Experiment9Runner {
             e.printStackTrace();
         } finally {
             if (rocksdb != null) rocksdb.close();
+        }
+    }
+
+    // ==================== 格式化输出辅助 ====================
+
+    /** 格式化打印单条 LightCurvePoint 的所有属性 */
+    private String formatPoint(LightCurvePoint p) {
+        return String.format(Locale.US,
+                "sourceId=%d, ra=%.6f, dec=%.6f, transitId=%d, band=%s, time=%.4f, " +
+                        "mag=%.4f, flux=%.6f, fluxErr=%.6f, fluxOverErr=%.4f, " +
+                        "rejPhoto=%s, rejVar=%s, flags=%d, solId=%d",
+                p.sourceId, p.ra, p.dec, p.transitId, p.band, p.time,
+                p.mag, p.flux, p.fluxError, p.fluxOverError,
+                p.rejectedByPhotometry, p.rejectedByVariability, p.otherFlags, p.solutionId);
+    }
+
+    /** 格式化打印简单查询的请求与响应 */
+    private void logSimpleQueryDetail(String system, int queryIdx, long sourceId,
+                                      List<LightCurvePoint> rows, double latencyMs) {
+        log(String.format("    [Simple-%d] REQUEST:  sourceId=%d", queryIdx, sourceId));
+        log(String.format("    [Simple-%d] RESPONSE: %d rows, latency=%.3fms", queryIdx, rows.size(), latencyMs));
+        int printCount = Math.min(rows.size(), MAX_PRINT_ROWS);
+        for (int r = 0; r < printCount; r++) {
+            log("      Row " + (r + 1) + ": " + formatPoint(rows.get(r)));
+        }
+        if (rows.size() > MAX_PRINT_ROWS) {
+            log("      ... (" + (rows.size() - MAX_PRINT_ROWS) + " more rows omitted)");
+        }
+    }
+
+    /** 格式化打印STMK查询的请求与响应 */
+    private void logSTMKQueryDetail(String system, int queryIdx, STMKQueryParams q,
+                                    List<Long> matchedIds, double latencyMs) {
+        log(String.format(Locale.US,
+                "    [STMK-%d] REQUEST:  ra=%.4f, dec=%.4f, radius=%.2f sq.deg, " +
+                        "t_min=%.2f, t_max=%.2f, mag_min=%.4f, mag_max=%.4f, count=%d",
+                queryIdx, q.ra, q.dec, q.radius,
+                q.startTime, q.endTime, q.magMin, q.magMax, q.minObs));
+        log(String.format("    [STMK-%d] RESPONSE: %d source_ids matched, latency=%.2fms",
+                queryIdx, matchedIds.size(), latencyMs));
+        if (!matchedIds.isEmpty()) {
+            int printCount = Math.min(matchedIds.size(), MAX_PRINT_IDS);
+            StringBuilder sb = new StringBuilder("      Matched source_ids: [");
+            for (int r = 0; r < printCount; r++) {
+                if (r > 0) sb.append(", ");
+                sb.append(matchedIds.get(r));
+            }
+            if (matchedIds.size() > MAX_PRINT_IDS) {
+                sb.append(", ... +(").append(matchedIds.size() - MAX_PRINT_IDS).append(" more)");
+            }
+            sb.append("]");
+            log(sb.toString());
         }
     }
 

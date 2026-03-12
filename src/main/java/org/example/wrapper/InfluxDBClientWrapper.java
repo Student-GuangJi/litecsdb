@@ -1,6 +1,7 @@
 package org.example.wrapper;
 
 import org.example.RocksDBServer.LightCurvePoint;
+import org.example.utils.HealpixUtil;
 import org.example.utils.StorageUtils;
 
 import com.influxdb.client.InfluxDBClient;
@@ -8,6 +9,7 @@ import com.influxdb.client.InfluxDBClientFactory;
 import com.influxdb.client.WriteApiBlocking;
 import com.influxdb.client.domain.WritePrecision;
 import com.influxdb.client.InfluxDBClientOptions;
+import healpix.RangeSet;
 import okhttp3.OkHttpClient;
 
 import java.io.*;
@@ -16,25 +18,28 @@ import java.net.URL;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * InfluxDB v2 客户端包装器（同步阻塞写入 + 重试 + 并行查询）
+ * InfluxDB v2 客户端包装器 — HEALPix 天区分区模型
  *
- * 查询优化（Experiment 9）：
- *   1. 多线程并行 Flux 查询（STMK 查询分片执行）
- *   2. 查询前清除缓存（重建 HTTP 连接）
- *   3. 应用层空间过滤（InfluxDB 不支持地理空间函数）
- *   4. 简单查询 + STMK 查询接口
+ * 数据结构（对标 LitecsDB）：
+ *   measurement = "hp_{healpixId}"
+ *   tags:  source_id, band, ra, dec
+ *   fields: transit_id, mag, flux, flux_error, flux_over_error,
+ *           rejected_by_photometry, rejected_by_variability, other_flags, solution_id
+ *   timestamp: GAIA epoch + time * MS_PER_DAY
  *
- * 环境变量（可选，不设则使用默认值）：
- *   INFLUX_CONNECTIONS   - HTTP 连接数（默认 32）
- *   INFLUX_WRITE_THREADS - 写入线程数（默认 16）
- *   INFLUX_QUERY_THREADS - 查询线程数（默认 8）
- *   INFLUX_BATCH_SIZE    - 每批写入行数（默认 10000）
+ * STMK 查询优化路径：
+ *   1. HealpixUtil.queryDisc → 天区剪枝
+ *   2. 只查目标天区 measurement（避免全表扫描）
+ *   3. tag 层面 source_id 过滤（TSI 索引加速）
+ *   4. 应用层精确 cone search
+ *   5. 时间+星等+计数聚合 → 返回 source_id 列表
  */
 public class InfluxDBClientWrapper implements AutoCloseable {
+
+    private static final int HEALPIX_LEVEL = 1;
 
     private final int writeThreads;
     private final int queryThreads;
@@ -44,8 +49,8 @@ public class InfluxDBClientWrapper implements AutoCloseable {
     private static final int MAX_RETRIES = 3;
     private static final long RETRY_BASE_MS = 3000;
 
-    private final InfluxDBClient[] clients;
-    private final WriteApiBlocking[] writeApis;
+    private InfluxDBClient[] clients;
+    private WriteApiBlocking[] writeApis;
 
     private final AtomicLong logicalBytesWritten = new AtomicLong(0);
     private final String dataDir = "/mnt/nvme/home/wangxc/.influxdbv2/engine/data/";
@@ -62,9 +67,7 @@ public class InfluxDBClientWrapper implements AutoCloseable {
     private static final long GAIA_EPOCH_UNIX_MS = 1420070400000L;
     private static final long MS_PER_DAY = 86400000L;
 
-    public InfluxDBClientWrapper() {
-        this("gaia_lightcurves");
-    }
+    public InfluxDBClientWrapper() { this("gaia_lightcurves"); }
 
     public InfluxDBClientWrapper(String bucket) {
         this.bucket = bucket;
@@ -72,101 +75,74 @@ public class InfluxDBClientWrapper implements AutoCloseable {
         this.token = System.getenv().getOrDefault("INFLUX_TOKEN", "wangxc");
         this.org = System.getenv().getOrDefault("INFLUX_ORG", "astro_research");
 
-        this.numConnections = Integer.parseInt(
-                System.getenv().getOrDefault("INFLUX_CONNECTIONS", "32"));
-        this.writeThreads = Integer.parseInt(
-                System.getenv().getOrDefault("INFLUX_WRITE_THREADS", "16"));
-        this.queryThreads = Integer.parseInt(
-                System.getenv().getOrDefault("INFLUX_QUERY_THREADS", "8"));
-        this.batchSize = Integer.parseInt(
-                System.getenv().getOrDefault("INFLUX_BATCH_SIZE", "10000"));
+        this.numConnections = Integer.parseInt(System.getenv().getOrDefault("INFLUX_CONNECTIONS", "32"));
+        this.writeThreads = Integer.parseInt(System.getenv().getOrDefault("INFLUX_WRITE_THREADS", "16"));
+        this.queryThreads = Integer.parseInt(System.getenv().getOrDefault("INFLUX_QUERY_THREADS", "8"));
+        this.batchSize = Integer.parseInt(System.getenv().getOrDefault("INFLUX_BATCH_SIZE", "10000"));
 
         this.clients = new InfluxDBClient[numConnections];
         this.writeApis = new WriteApiBlocking[numConnections];
-
         for (int i = 0; i < numConnections; i++) {
-            OkHttpClient.Builder okBuilder = new OkHttpClient.Builder()
-                    .readTimeout(300, TimeUnit.SECONDS)
-                    .writeTimeout(300, TimeUnit.SECONDS)
-                    .connectTimeout(60, TimeUnit.SECONDS)
-                    .retryOnConnectionFailure(true)
-                    .proxy(java.net.Proxy.NO_PROXY);
-
-            InfluxDBClientOptions options = InfluxDBClientOptions.builder()
-                    .url(url)
-                    .authenticateToken(token.toCharArray())
-                    .org(org)
-                    .bucket(bucket)
-                    .okHttpClient(okBuilder)
-                    .build();
-
-            clients[i] = InfluxDBClientFactory.create(options);
+            clients[i] = createClient();
             writeApis[i] = clients[i].getWriteApiBlocking();
         }
 
         boolean healthy = clients[0].ping();
-        System.out.printf("[Phase 1] InfluxDB 连接 %s (bucket=%s)%n",
-                healthy ? "正常" : "失败", bucket);
+        System.out.printf("[Phase 1] InfluxDB 连接 %s (bucket=%s, healpix_level=%d)%n",
+                healthy ? "正常" : "失败", bucket, HEALPIX_LEVEL);
 
         this.writePool = Executors.newFixedThreadPool(writeThreads, r -> {
-            Thread t = new Thread(r);
-            t.setDaemon(true);
-            t.setName("InfluxDB-Writer-" + t.getId());
-            return t;
+            Thread t = new Thread(r); t.setDaemon(true); t.setName("InfluxDB-Writer-" + t.getId()); return t;
         });
-
         this.queryPool = Executors.newFixedThreadPool(queryThreads, r -> {
-            Thread t = new Thread(r);
-            t.setDaemon(true);
-            t.setName("InfluxDB-Query-" + t.getId());
-            return t;
+            Thread t = new Thread(r); t.setDaemon(true); t.setName("InfluxDB-Query-" + t.getId()); return t;
         });
-
         this.initialDirSize = StorageUtils.getDirectorySize(dataDir);
-
-        System.out.printf("[Phase 1] InfluxDB 初始化完成%n");
         System.out.printf("  连接数=%d, 写入线程=%d, 查询线程=%d, 批大小=%d%n",
                 numConnections, writeThreads, queryThreads, batchSize);
     }
 
-    // ==================== 写入方法 ====================
+    private InfluxDBClient createClient() {
+        OkHttpClient.Builder okBuilder = new OkHttpClient.Builder()
+                .readTimeout(300, TimeUnit.SECONDS).writeTimeout(300, TimeUnit.SECONDS)
+                .connectTimeout(60, TimeUnit.SECONDS).retryOnConnectionFailure(true)
+                .proxy(java.net.Proxy.NO_PROXY);
+        InfluxDBClientOptions options = InfluxDBClientOptions.builder()
+                .url(url).authenticateToken(token.toCharArray())
+                .org(org).bucket(bucket).okHttpClient(okBuilder).build();
+        return InfluxDBClientFactory.create(options);
+    }
+
+    // ==================== 写入 ====================
 
     public void putBatch(List<LightCurvePoint> points) {
         if (points == null || points.isEmpty()) return;
-
         logicalBytesWritten.addAndGet(points.size() * 90L);
 
         int chunkSize = Math.max(1, (points.size() + writeThreads - 1) / writeThreads);
         List<List<LightCurvePoint>> chunks = new ArrayList<>();
-        for (int i = 0; i < points.size(); i += chunkSize) {
+        for (int i = 0; i < points.size(); i += chunkSize)
             chunks.add(points.subList(i, Math.min(i + chunkSize, points.size())));
-        }
 
         CountDownLatch latch = new CountDownLatch(chunks.size());
         for (int idx = 0; idx < chunks.size(); idx++) {
             final int threadIdx = idx;
             final List<LightCurvePoint> chunk = chunks.get(idx);
-
             writePool.submit(() -> {
-                try {
-                    writeChunkAsLineProtocol(threadIdx, chunk);
-                } catch (Exception e) {
-                    writeFailures.addAndGet(chunk.size());
-                    System.err.println("InfluxDB 写入失败: " + e.getMessage());
-                } finally {
-                    latch.countDown();
-                }
+                try { writeChunk(threadIdx, chunk); }
+                catch (Exception e) { writeFailures.addAndGet(chunk.size()); System.err.println("InfluxDB 写入失败: " + e.getMessage()); }
+                finally { latch.countDown(); }
             });
         }
-
-        try {
-            latch.await(600, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { latch.await(600, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
-    private void writeChunkAsLineProtocol(int threadIdx, List<LightCurvePoint> points) {
+    /**
+     * Line Protocol:
+     *   hp_23,source_id=12345,band=G,ra=180.123456,dec=-23.456789
+     *     transit_id=67890i,mag=15.23,flux=1234.56,...  1420070400000
+     */
+    private void writeChunk(int threadIdx, List<LightCurvePoint> points) {
         for (int start = 0; start < points.size(); start += batchSize) {
             int end = Math.min(start + batchSize, points.size());
             List<String> lines = new ArrayList<>(end - start);
@@ -174,546 +150,248 @@ public class InfluxDBClientWrapper implements AutoCloseable {
             for (int i = start; i < end; i++) {
                 LightCurvePoint p = points.get(i);
                 long tsMs = GAIA_EPOCH_UNIX_MS + (long) (p.time * MS_PER_DAY);
+                long hpid = HealpixUtil.raDecToHealpix(p.ra, p.dec, HEALPIX_LEVEL);
 
                 lines.add(String.format(Locale.US,
-                        "lightcurve,source_id=%d,band=%s " +
-                                "ra=%.6f,dec=%.6f,transit_id=%di,mag=%.6f,flux=%.6f," +
+                        "hp_%d,source_id=%d,band=%s,ra=%.6f,dec=%.6f " +
+                                "transit_id=%di,mag=%.6f,flux=%.6f," +
                                 "flux_error=%.6f,flux_over_error=%.6f," +
                                 "rejected_by_photometry=%s,rejected_by_variability=%s," +
                                 "other_flags=%di,solution_id=%di " +
                                 "%d",
-                        p.sourceId, p.band,
-                        p.ra, p.dec, p.transitId, p.mag, p.flux,
+                        hpid, p.sourceId, p.band, p.ra, p.dec,
+                        p.transitId, p.mag, p.flux,
                         p.fluxError, p.fluxOverError,
                         p.rejectedByPhotometry, p.rejectedByVariability,
-                        p.otherFlags, p.solutionId,
-                        tsMs));
+                        p.otherFlags, p.solutionId, tsMs));
             }
 
             int connIdx = (threadIdx + start / batchSize) % numConnections;
-
             for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-                try {
-                    writeApis[connIdx].writeRecords(WritePrecision.MS, lines);
-                    break;
-                } catch (Exception e) {
-                    if (attempt == MAX_RETRIES) {
-                        throw e;
-                    }
+                try { writeApis[connIdx].writeRecords(WritePrecision.MS, lines); break; }
+                catch (Exception e) {
+                    if (attempt == MAX_RETRIES) throw e;
                     long waitMs = RETRY_BASE_MS * (1L << attempt);
-                    System.err.printf("[重试] InfluxDB 写入超时，%dms 后第 %d/%d 次重试: %s%n",
-                            waitMs, attempt + 1, MAX_RETRIES, e.getMessage());
-                    try {
-                        Thread.sleep(waitMs);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw e;
-                    }
+                    try { Thread.sleep(waitMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw e; }
                     connIdx = (connIdx + 1) % numConnections;
                 }
             }
         }
     }
 
-    // ==================== 查询方法（Experiment 9） ====================
+    // ==================== 查询 ====================
 
-    /**
-     * 清除 InfluxDB 查询缓存
-     * InfluxDB v2 没有直接的 cache clear 命令。
-     * 通过以下方式尽量消除缓存影响：
-     * 1. 调用内部 compact（如果 API 支持）
-     * 2. 等待足够时间让内存缓存老化
-     * 3. 在查询中使用不同的时间窗口避免查询计划缓存
-     */
     public void clearQueryCache() {
         try {
-            // 关闭并重建所有客户端连接，清除连接层面的缓存
-            for (int i = 0; i < numConnections; i++) {
-                if (clients[i] != null) {
-                    clients[i].close();
-                }
-            }
-
-            // 短暂等待
+            for (int i = 0; i < numConnections; i++) { if (clients[i] != null) clients[i].close(); }
             Thread.sleep(1000);
-
-            // 重建连接
-            for (int i = 0; i < numConnections; i++) {
-                OkHttpClient.Builder okBuilder = new OkHttpClient.Builder()
-                        .readTimeout(300, TimeUnit.SECONDS)
-                        .writeTimeout(300, TimeUnit.SECONDS)
-                        .connectTimeout(60, TimeUnit.SECONDS)
-                        .retryOnConnectionFailure(true)
-                        .proxy(java.net.Proxy.NO_PROXY);
-
-                InfluxDBClientOptions options = InfluxDBClientOptions.builder()
-                        .url(url)
-                        .authenticateToken(token.toCharArray())
-                        .org(org)
-                        .bucket(bucket)
-                        .okHttpClient(okBuilder)
-                        .build();
-
-                clients[i] = InfluxDBClientFactory.create(options);
-                writeApis[i] = clients[i].getWriteApiBlocking();
-            }
-        } catch (Exception e) {
-            System.err.println("[WARN] InfluxDB cache clear failed: " + e.getMessage());
-        }
+            for (int i = 0; i < numConnections; i++) { clients[i] = createClient(); writeApis[i] = clients[i].getWriteApiBlocking(); }
+        } catch (Exception e) { System.err.println("[WARN] InfluxDB cache clear failed: " + e.getMessage()); }
     }
 
     /**
-     * 简单查询：按 source_id 查光变曲线
-     * 使用 HTTP API 直接发送 Flux 查询
+     * 简单查询：按 source_id 返回该天体全部观测数据（每行每列）
+     *
+     * source_id 是 tag → TSI 索引高效定位，遍历所有 measurement(hp_*)
+     * 用 pivot 展开所有 field 为宽表
      */
-    public int executeSimpleQuery(long sourceId) {
+    public List<String> executeSimpleQuery(long sourceId) {
         String flux = String.format(
                 "from(bucket: \"%s\") " +
                         "|> range(start: 0) " +
                         "|> filter(fn: (r) => r.source_id == \"%d\") " +
-                        "|> filter(fn: (r) => r._field == \"mag\")",
+                        "|> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")",
                 bucket, sourceId);
-        return executeFluxQueryHttp(flux);
+        return executeFluxQueryReturnRows(flux);
     }
 
     /**
-     * 多线程并行简单查询
-     */
-    public List<int[]> executeSimpleQueryParallel(List<Long> sourceIds) {
-        List<int[]> allResults = new ArrayList<>();
-        for (int i = 0; i < sourceIds.size(); i++) {
-            allResults.add(new int[]{0, 0});
-        }
-
-        int chunkSize = Math.max(1, (sourceIds.size() + queryThreads - 1) / queryThreads);
-        int actualThreads = Math.min(queryThreads, (sourceIds.size() + chunkSize - 1) / chunkSize);
-        CountDownLatch latch = new CountDownLatch(actualThreads);
-
-        for (int t = 0; t < actualThreads; t++) {
-            final int threadIdx = t;
-            final int start = t * chunkSize;
-            final int end = Math.min(start + chunkSize, sourceIds.size());
-
-            queryPool.submit(() -> {
-                try {
-                    for (int i = start; i < end; i++) {
-                        long qStart = System.nanoTime();
-                        int count = executeSimpleQuery(sourceIds.get(i));
-                        allResults.get(i)[0] = count;
-                        allResults.get(i)[1] = (int) ((System.nanoTime() - qStart) / 1_000_000);
-                    }
-                } catch (Exception e) {
-                    System.err.println("InfluxDB simple query thread " + threadIdx + " failed: " + e.getMessage());
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
-
-        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        return allResults;
-    }
-
-    /**
-     * STMK 查询（单线程版本）
+     * STMK 查询 — HEALPix 天区剪枝优化
      *
-     * Flux 等价查询：
-     *   from(bucket) |> range(start, stop)
-     *   |> filter(measurement == "lightcurve" and band == X and _field == "mag")
-     *   |> filter(_value >= magMin and _value <= magMax)
-     *   |> group(columns: ["source_id"])
-     *   |> count()
-     *   |> filter(_value >= minObs)
-     *
-     * 然后获取满足条件的 source_id 的 ra/dec，做应用层 cone search。
+     * 步骤:
+     *   1. queryDisc(ra,dec,radius) → 天区 ID 集合
+     *   2. 只查目标天区 measurement "hp_{id}"
+     *   3. time range + mag filter + group by source_id + count
+     *   4. count >= minObs 过滤
+     *   5. 从 tag 取 ra/dec → 精确 cone search
+     *   6. 返回匹配的 source_id 列表
      */
-    public int executeSTMKQuery(double ra, double dec, double radius,
-                                double startTime, double endTime, String band,
-                                double magMin, double magMax, int minObs) {
-
+    public List<Long> executeSTMKQuery(double ra, double dec, double radius,
+                                       double startTime, double endTime,
+                                       double magMin, double magMax, int minObs) {
         long startMs = GAIA_EPOCH_UNIX_MS + (long) (startTime * MS_PER_DAY);
         long endMs = GAIA_EPOCH_UNIX_MS + (long) (endTime * MS_PER_DAY);
 
-        // Step 1: 获取满足时间+波段+星等+计数条件的 source_id 列表
+        // Step 1: HEALPix 天区剪枝
+        Set<Long> healpixIds = calculateHealpixIdsInCone(ra, dec, radius);
+        if (healpixIds.isEmpty()) return Collections.emptyList();
+
+        // Step 2: 构建 measurement 过滤条件
+        StringBuilder mFilter = new StringBuilder();
+        boolean first = true;
+        for (Long hpid : healpixIds) {
+            if (!first) mFilter.append(" or ");
+            mFilter.append("r._measurement == \"hp_").append(hpid).append("\"");
+            first = false;
+        }
+
+        // Step 3: Flux 查询 — 时间+星等+计数
         String flux = String.format(Locale.US,
                 "from(bucket: \"%s\") " +
                         "|> range(start: %d, stop: %d) " +
-                        "|> filter(fn: (r) => r._measurement == \"lightcurve\" and r.band == \"%s\" and r._field == \"mag\") " +
+                        "|> filter(fn: (r) => %s) " +
+                        "|> filter(fn: (r) => r._field == \"mag\") " +
                         "|> filter(fn: (r) => r._value >= %f and r._value <= %f) " +
                         "|> group(columns: [\"source_id\"]) " +
                         "|> count() " +
                         "|> filter(fn: (r) => r._value >= %d)",
-                bucket, startMs, endMs, band, magMin, magMax, minObs);
+                bucket, startMs, endMs, mFilter.toString(), magMin, magMax, minObs);
 
-        // 获取候选 source_id
-        List<Long> candidateSourceIds = executeFluxQueryGetSourceIds(flux);
+        // Step 4: 获取候选 source_id
+        List<Long> candidateIds = executeFluxQueryGetSourceIds(flux);
+        if (candidateIds.isEmpty()) return Collections.emptyList();
 
-        if (candidateSourceIds.isEmpty()) return 0;
-
-        // Step 2: 对候选 source_id 查询 ra/dec 做空间过滤
-        return filterByConeSearch(candidateSourceIds, ra, dec, radius);
-    }
-
-    /**
-     * STMK 多线程并行查询
-     *
-     * 将时间范围分成多段，每段由一个线程独立查询，
-     * 最后合并结果并做空间过滤。
-     *
-     * 分片策略：按时间窗口切分（适合时序数据库的查询模式）
-     */
-    public int executeSTMKQueryParallel(double centerRa, double centerDec, double radius,
-                                        double startTime, double endTime, String band,
-                                        double magMin, double magMax, int minObs) {
-
-        long startMs = GAIA_EPOCH_UNIX_MS + (long) (startTime * MS_PER_DAY);
-        long endMs = GAIA_EPOCH_UNIX_MS + (long) (endTime * MS_PER_DAY);
-        long totalRange = endMs - startMs;
-
-        if (totalRange <= 0) return 0;
-
-        // 分成 queryThreads 个时间段并行查询
-        // 注意：由于 HAVING count >= K 是跨时间段的全局约束，
-        // 分片后需要在合并阶段重新聚合计数
-        int numShards = queryThreads;
-        long shardSize = (totalRange + numShards - 1) / numShards;
-
-        // 每个线程收集: source_id -> partial count
-        @SuppressWarnings("unchecked")
-        Map<String, Integer>[] shardResults = new Map[numShards];
-        for (int i = 0; i < numShards; i++) {
-            shardResults[i] = new HashMap<>();
-        }
-
-        CountDownLatch latch = new CountDownLatch(numShards);
-
-        for (int s = 0; s < numShards; s++) {
-            final int shardIdx = s;
-            final long shardStart = startMs + s * shardSize;
-            final long shardEnd = Math.min(shardStart + shardSize, endMs);
-
+        // Step 5: 精确 cone search 空间过滤（从 tag 读 ra/dec）
+        List<Long> matchedIds = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(candidateIds.size());
+        for (long sid : candidateIds) {
             queryPool.submit(() -> {
                 try {
-                    // 每个分片的 Flux 查询：不做 HAVING 过滤，只做分组计数
-                    String flux = String.format(Locale.US,
-                            "from(bucket: \"%s\") " +
-                                    "|> range(start: %d, stop: %d) " +
-                                    "|> filter(fn: (r) => r._measurement == \"lightcurve\" and r.band == \"%s\" and r._field == \"mag\") " +
-                                    "|> filter(fn: (r) => r._value >= %f and r._value <= %f) " +
-                                    "|> group(columns: [\"source_id\"]) " +
-                                    "|> count()",
-                            bucket, shardStart, shardEnd, band, magMin, magMax);
-
-                    Map<String, Integer> partialCounts = executeFluxQueryGetCounts(flux);
-                    shardResults[shardIdx] = partialCounts;
-
-                } catch (Exception e) {
-                    System.err.println("InfluxDB STMK query shard " + shardIdx + " failed: " + e.getMessage());
-                } finally {
-                    latch.countDown();
-                }
+                    double[] coord = getSourceCoordFromTag(sid);
+                    if (coord != null && isInCone(coord[0], coord[1], ra, dec, radius)) {
+                        matchedIds.add(sid);
+                    }
+                } catch (Exception e) { /* ignore */ }
+                finally { latch.countDown(); }
             });
         }
-
-        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-
-        // 合并各分片的计数
-        Map<String, Integer> globalCounts = new HashMap<>();
-        for (Map<String, Integer> shard : shardResults) {
-            for (Map.Entry<String, Integer> entry : shard.entrySet()) {
-                globalCounts.merge(entry.getKey(), entry.getValue(), Integer::sum);
-            }
-        }
-
-        // 过滤满足 minObs 的 source_id
-        List<Long> candidateSourceIds = new ArrayList<>();
-        for (Map.Entry<String, Integer> entry : globalCounts.entrySet()) {
-            if (entry.getValue() >= minObs) {
-                try {
-                    candidateSourceIds.add(Long.parseLong(entry.getKey()));
-                } catch (NumberFormatException e) {
-                    // ignore
-                }
-            }
-        }
-
-        if (candidateSourceIds.isEmpty()) return 0;
-
-        // 空间过滤
-        return filterByConeSearch(candidateSourceIds, centerRa, centerDec, radius);
+        try { latch.await(120, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return matchedIds;
     }
 
-    /**
-     * 对候选 source_id 做空间过滤
-     * 需要从 InfluxDB 获取每个 source_id 的 ra/dec
-     */
-    private int filterByConeSearch(List<Long> sourceIds, double centerRa, double centerDec, double radius) {
-        // 并行获取 ra/dec
-        AtomicInteger count = new AtomicInteger(0);
-        int chunkSize = Math.max(1, (sourceIds.size() + queryThreads - 1) / queryThreads);
-        int actualThreads = Math.min(queryThreads, (sourceIds.size() + chunkSize - 1) / chunkSize);
-        CountDownLatch latch = new CountDownLatch(actualThreads);
-
-        for (int t = 0; t < actualThreads; t++) {
-            final int start = t * chunkSize;
-            final int end = Math.min(start + chunkSize, sourceIds.size());
-
-            queryPool.submit(() -> {
-                try {
-                    for (int i = start; i < end; i++) {
-                        long sid = sourceIds.get(i);
-                        // 获取该 source_id 的 ra/dec（查一条记录即可）
-                        String flux = String.format(
-                                "from(bucket: \"%s\") " +
-                                        "|> range(start: 0) " +
-                                        "|> filter(fn: (r) => r.source_id == \"%d\" and r._field == \"ra\") " +
-                                        "|> first()",
-                                bucket, sid);
-
-                        double[] coord = executeFluxQueryGetFirstRaDec(sid);
-                        if (coord != null && isInCone(coord[0], coord[1], centerRa, centerDec, radius)) {
-                            count.incrementAndGet();
+    /** 从 tag 读取天体坐标（ra/dec 现在是 tag，一条查询即可获取） */
+    private double[] getSourceCoordFromTag(long sourceId) {
+        String flux = String.format(
+                "from(bucket: \"%s\") |> range(start: 0) " +
+                        "|> filter(fn: (r) => r.source_id == \"%d\") |> first()",
+                bucket, sourceId);
+        try {
+            HttpURLConnection conn = openFluxConnection(120000);
+            try (OutputStream os = conn.getOutputStream()) { os.write(flux.getBytes()); }
+            if (conn.getResponseCode() != 200) return null;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                String line; String header = null; int raCol = -1, decCol = -1;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isEmpty()) { header = null; continue; }
+                    if (line.startsWith("#")) continue;
+                    if (header == null) {
+                        header = line;
+                        String[] cols = line.split(",");
+                        for (int i = 0; i < cols.length; i++) {
+                            if ("ra".equals(cols[i].trim())) raCol = i;
+                            if ("dec".equals(cols[i].trim())) decCol = i;
+                        }
+                        continue;
+                    }
+                    if (raCol >= 0 && decCol >= 0) {
+                        String[] parts = line.split(",");
+                        if (parts.length > Math.max(raCol, decCol)) {
+                            return new double[]{
+                                    Double.parseDouble(parts[raCol].trim()),
+                                    Double.parseDouble(parts[decCol].trim())};
                         }
                     }
-                } catch (Exception e) {
-                    // ignore
-                } finally {
-                    latch.countDown();
                 }
-            });
-        }
-
-        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        return count.get();
-    }
-
-    /**
-     * 获取一个 source_id 的 ra 和 dec（用于空间过滤）
-     */
-    private double[] executeFluxQueryGetFirstRaDec(long sourceId) {
-        try {
-            // ra
-            String fluxRa = String.format(
-                    "from(bucket: \"%s\") " +
-                            "|> range(start: 0) " +
-                            "|> filter(fn: (r) => r.source_id == \"%d\" and r._field == \"ra\") " +
-                            "|> first()",
-                    bucket, sourceId);
-
-            String fluxDec = String.format(
-                    "from(bucket: \"%s\") " +
-                            "|> range(start: 0) " +
-                            "|> filter(fn: (r) => r.source_id == \"%d\" and r._field == \"dec\") " +
-                            "|> first()",
-                    bucket, sourceId);
-
-            double ra = executeFluxQueryGetFirstValue(fluxRa);
-            double dec = executeFluxQueryGetFirstValue(fluxDec);
-
-            if (!Double.isNaN(ra) && !Double.isNaN(dec)) {
-                return new double[]{ra, dec};
             }
-        } catch (Exception e) {
-            // ignore
-        }
+        } catch (Exception e) { /* ignore */ }
         return null;
     }
 
-    private double executeFluxQueryGetFirstValue(String flux) {
+    /** HEALPix cone search 计算涉及天区 */
+    private Set<Long> calculateHealpixIdsInCone(double ra, double dec, double radius) {
+        Set<Long> ids = new HashSet<>();
         try {
-            HttpURLConnection conn = (HttpURLConnection)
-                    new URL(url + "/api/v2/query?org=" + org).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + token);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(60000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
+            new HealpixUtil().setNside(HEALPIX_LEVEL);
+            RangeSet rs = HealpixUtil.queryDisc(ra, dec, radius, HEALPIX_LEVEL);
+            if (rs != null) {
+                for (int i = 0; i < rs.nranges(); i++)
+                    for (long pix = rs.ivbegin(i); pix <= rs.ivend(i); pix++) ids.add(pix);
             }
-
-            if (conn.getResponseCode() != 200) return Double.NaN;
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith(",")) {
-                        String[] parts = line.split(",");
-                        if (parts.length > 6) {
-                            try {
-                                return Double.parseDouble(parts[6].trim());
-                            } catch (NumberFormatException e) {
-                                // continue
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            // ignore
-        }
-        return Double.NaN;
+        } catch (Exception e) { System.err.println("[WARN] HEALPix queryDisc failed: " + e.getMessage()); }
+        return ids;
     }
 
-    /**
-     * 执行 Flux 查询，返回 source_id 列表
-     */
+    // ==================== Flux 基础方法 ====================
+
+    private HttpURLConnection openFluxConnection(int readTimeout) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url + "/api/v2/query?org=" + org).openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Authorization", "Token " + token);
+        conn.setRequestProperty("Content-Type", "application/vnd.flux");
+        conn.setConnectTimeout(60000);
+        conn.setReadTimeout(readTimeout);
+        conn.setDoOutput(true);
+        return conn;
+    }
+
+    private List<String> executeFluxQueryReturnRows(String flux) {
+        List<String> rows = new ArrayList<>();
+        try {
+            HttpURLConnection conn = openFluxConnection(120000);
+            try (OutputStream os = conn.getOutputStream()) { os.write(flux.getBytes()); }
+            if (conn.getResponseCode() != 200) return rows;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                String line; String header = null;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isEmpty()) { header = null; continue; }
+                    if (line.startsWith("#")) continue;
+                    if (header == null) { header = line; continue; }
+                    rows.add(line);
+                }
+            }
+        } catch (Exception e) { /* ignore */ }
+        return rows;
+    }
+
     private List<Long> executeFluxQueryGetSourceIds(String flux) {
-        List<Long> sourceIds = new ArrayList<>();
+        List<Long> ids = new ArrayList<>();
         try {
-            HttpURLConnection conn = (HttpURLConnection)
-                    new URL(url + "/api/v2/query?org=" + org).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + token);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(120000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
-            }
-
-            if (conn.getResponseCode() != 200) return sourceIds;
-
+            HttpURLConnection conn = openFluxConnection(600000);
+            try (OutputStream os = conn.getOutputStream()) { os.write(flux.getBytes()); }
+            if (conn.getResponseCode() != 200) return ids;
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                String headerLine = null;
-                int sourceIdColIdx = -1;
-
+                String line; int sidCol = -1;
                 while ((line = reader.readLine()) != null) {
-                    if (line.isEmpty()) continue;
+                    if (line.isEmpty()) { sidCol = -1; continue; }
                     if (line.startsWith("#")) continue;
-
-                    // 第一个非注释行是表头
-                    if (headerLine == null) {
-                        headerLine = line;
-                        String[] headers = line.split(",");
-                        for (int i = 0; i < headers.length; i++) {
-                            if (headers[i].trim().equals("source_id")) {
-                                sourceIdColIdx = i;
-                                break;
-                            }
-                        }
+                    String[] parts = line.split(",");
+                    if (sidCol < 0) {
+                        for (int j = 0; j < parts.length; j++)
+                            if ("source_id".equals(parts[j].trim())) { sidCol = j; break; }
                         continue;
                     }
-
-                    // 数据行
-                    if (sourceIdColIdx >= 0) {
-                        String[] parts = line.split(",");
-                        if (parts.length > sourceIdColIdx) {
-                            try {
-                                sourceIds.add(Long.parseLong(parts[sourceIdColIdx].trim()));
-                            } catch (NumberFormatException e) {
-                                // ignore
-                            }
-                        }
+                    if (parts.length > sidCol) {
+                        try { ids.add(Long.parseLong(parts[sidCol].trim())); } catch (NumberFormatException e) {}
                     }
                 }
             }
-        } catch (Exception e) {
-            System.err.println("InfluxDB Flux query for sourceIds failed: " + e.getMessage());
-        }
-        return sourceIds;
+        } catch (Exception e) { System.err.println("Flux sourceId query failed: " + e.getMessage()); }
+        return ids;
     }
 
-    /**
-     * 执行 Flux 查询，返回 source_id -> count 映射
-     */
-    private Map<String, Integer> executeFluxQueryGetCounts(String flux) {
-        Map<String, Integer> counts = new HashMap<>();
-        try {
-            HttpURLConnection conn = (HttpURLConnection)
-                    new URL(url + "/api/v2/query?org=" + org).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + token);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(120000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
-            }
-
-            if (conn.getResponseCode() != 200) return counts;
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                String headerLine = null;
-                int sourceIdColIdx = -1;
-                int valueColIdx = -1;
-
-                while ((line = reader.readLine()) != null) {
-                    if (line.isEmpty()) continue;
-                    if (line.startsWith("#")) continue;
-
-                    if (headerLine == null) {
-                        headerLine = line;
-                        String[] headers = line.split(",");
-                        for (int i = 0; i < headers.length; i++) {
-                            String h = headers[i].trim();
-                            if (h.equals("source_id")) sourceIdColIdx = i;
-                            if (h.equals("_value")) valueColIdx = i;
-                        }
-                        continue;
-                    }
-
-                    if (sourceIdColIdx >= 0 && valueColIdx >= 0) {
-                        String[] parts = line.split(",");
-                        if (parts.length > Math.max(sourceIdColIdx, valueColIdx)) {
-                            try {
-                                String sid = parts[sourceIdColIdx].trim();
-                                int cnt = (int) Double.parseDouble(parts[valueColIdx].trim());
-                                counts.merge(sid, cnt, Integer::sum);
-                            } catch (NumberFormatException e) {
-                                // ignore
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            System.err.println("InfluxDB Flux count query failed: " + e.getMessage());
-        }
-        return counts;
-    }
-
-    /**
-     * 通用 Flux 查询，返回结果行数
-     */
     public int executeFluxQueryHttp(String flux) {
         try {
-            HttpURLConnection conn = (HttpURLConnection)
-                    new URL(url + "/api/v2/query?org=" + org).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Token " + token);
-            conn.setRequestProperty("Content-Type", "application/vnd.flux");
-            conn.setConnectTimeout(30000);
-            conn.setReadTimeout(60000);
-            conn.setDoOutput(true);
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(flux.getBytes());
-            }
-
+            HttpURLConnection conn = openFluxConnection(60000);
+            try (OutputStream os = conn.getOutputStream()) { os.write(flux.getBytes()); }
             if (conn.getResponseCode() != 200) return 0;
-
             int count = 0;
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
                 String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith(",")) {
-                        count++;
-                    }
-                }
+                while ((line = reader.readLine()) != null)
+                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith(",")) count++;
             }
             return Math.max(0, count - 1);
-        } catch (Exception e) {
-            return 0;
-        }
+        } catch (Exception e) { return 0; }
     }
 
     // ==================== 空间工具 ====================
@@ -734,9 +412,7 @@ public class InfluxDBClientWrapper implements AutoCloseable {
     public String getToken() { return token; }
     public String getOrg() { return org; }
 
-    public void forceFlush() {
-        try { Thread.sleep(2000); } catch (InterruptedException e) {}
-    }
+    public void forceFlush() { try { Thread.sleep(2000); } catch (InterruptedException e) {} }
 
     public double getWriteAmplification() {
         long logical = logicalBytesWritten.get();
@@ -751,9 +427,7 @@ public class InfluxDBClientWrapper implements AutoCloseable {
             OffsetDateTime start = OffsetDateTime.now().minusYears(50);
             OffsetDateTime stop = OffsetDateTime.now().plusYears(50);
             clients[0].getDeleteApi().delete(start, stop, "", bucket, org);
-        } catch (Exception e) {
-            System.err.println("清理 InfluxDB 数据失败: " + e.getMessage());
-        }
+        } catch (Exception e) { System.err.println("清理 InfluxDB 数据失败: " + e.getMessage()); }
     }
 
     public boolean hasWriteFailures() { return writeFailures.get() > 0; }
@@ -761,8 +435,7 @@ public class InfluxDBClientWrapper implements AutoCloseable {
 
     @Override
     public void close() {
-        writePool.shutdown();
-        queryPool.shutdown();
+        writePool.shutdown(); queryPool.shutdown();
         try { writePool.awaitTermination(30, TimeUnit.SECONDS); } catch (InterruptedException e) {}
         try { queryPool.awaitTermination(30, TimeUnit.SECONDS); } catch (InterruptedException e) {}
         for (InfluxDBClient c : clients) { if (c != null) c.close(); }

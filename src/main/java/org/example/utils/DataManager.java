@@ -3,6 +3,7 @@ package org.example.utils;
 import org.example.RocksDBServer.LightCurvePoint;
 import org.example.wrapper.InfluxDBClientWrapper;
 import org.example.wrapper.NativeRocksDBWrapper;
+import org.example.wrapper.TDengineClientWrapper;
 import org.example.MainNode;
 import org.example.RocksDBServer.StarMetadata;
 
@@ -12,9 +13,7 @@ import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
 
 /**
  * DataManager — 统一的数据导入与删除管理工具
@@ -24,29 +23,21 @@ import java.util.stream.Collectors;
  *   java DataManager insert incremental <size> [--data-dir <dir>]
  *   java DataManager delete [--data-dir <dir>]
  *
- * 功能：
- *   insert: 将指定数据集导入 LitecsDB / TDengine / InfluxDB / NativeRocksDB 四个系统，
- *           导入后自动构建各系统索引（LitecsDB 时间桶索引、TDengine 子表 TAG 索引、
- *           InfluxDB TSI 索引、RocksDB LSM compaction）
- *   delete: 清除四个数据库的所有数据
+ * 写入策略（对齐 Experiment1Runner 两阶段高性能写入）：
+ *   Phase 1: 预创建分区/子表 + 预解析 CSV（不计入写入时间）
+ *   Phase 2: 顺序写入各系统（每个系统内部已有 16 线程并行）
  *
- * 数据集格式：
- *   batch:       generated_datasets/batch_{size}/individual_lightcurves/lightcurve_{sid}.csv
- *                表头：source_id,transit_id,band,time,mag,flux,flux_error,...  (12列，无坐标)
- *                需提供坐标文件 --coords star_coordinates.csv (source_id,ra,dec)
- *
- *   incremental: generated_datasets/incremental_{size}/observation_records_by_time/time_{ts}.csv
- *                表头：source_id,ra,dec,transit_id,band,time,mag,...  (14列，含坐标)
- *
- * TDengine 索引优化：
- *   使用 per-source 子表（每个 source_id 一张子表），TAG 含 source_id/ra/dec_val，
- *   查询时 PARTITION BY TBNAME 可高效聚合 + 获取空间坐标。
+ * 性能关键点：
+ *   - 大批量: 200 万行/批（与 Experiment1Runner 对齐）
+ *   - 一次解析: CSV 只解析一次为 LightCurvePoint，所有系统复用
+ *   - 直接分组: LitecsDB 直接按 healpixId 分组写入，跳过 CSV 反序列化
+ *   - 顺序写入: 各系统顺序执行（避免 4 线程协调开销，系统内部已并行）
+ *   - TDengine: 使用 TDengineClientWrapper.putBatch() 内部多线程写入
  */
 public class DataManager {
 
     // ==================== 路径配置 ====================
     private static String DATA_BASE_DIR = "generated_datasets/";
-    private static String COORDS_FILE = "gaiadr2/source_coordinates.csv";
     private static final String RESULT_DIR = "experiment9_results/";
 
     // LitecsDB
@@ -54,32 +45,19 @@ public class DataManager {
     private static final int NODE_COUNT = 2;
     private static String LITECSDB_PATH = RESULT_DIR + "litecsdb_exp9/";
 
-    // TDengine
-    private static final String TDENGINE_HOST = "127.0.0.1";
-    private static final int TDENGINE_PORT = 6030;
-    private static final String TDENGINE_USER = "root";
-    private static final String TDENGINE_PASSWORD = "taosdata";
-    private static final int TDENGINE_VGROUPS = 32;
-    // per-source 子表上限（超过则回退到 hash 分桶）
-    private static final int TDENGINE_MAX_SUBTABLES = 600_000;
+    // NativeRocksDB
+    private static String ROCKSDB_PATH = RESULT_DIR + "rocksdb_exp9/";
 
     // InfluxDB
     private static final String INFLUX_BUCKET = "gaia_lightcurves";
 
-    // NativeRocksDB
-    private static String ROCKSDB_PATH = RESULT_DIR + "rocksdb_exp9/";
+    // TDengine
+    private static final String TDENGINE_DB = "astro_exp9";
 
-    // 写入批次大小
-    private static final int WRITE_BATCH_SIZE = 50_000;
-
-    // GAIA 时间转换
-    private static final long GAIA_EPOCH_UNIX_US = 1420070400000000L;
-    private static final long US_PER_DAY = 86400000000L;
-    private static final long GAIA_EPOCH_UNIX_MS = 1420070400000L;
-    private static final long MS_PER_DAY = 86400000L;
+    // 写入批次大小 — 对齐 Experiment1Runner 的 2M
+    private static final int BATCH_SIZE = 2_000_000;
 
     // ==================== 统计 ====================
-    private final AtomicLong totalRowsLoaded = new AtomicLong(0);
     private final AtomicLong totalRowsFailed = new AtomicLong(0);
     private PrintWriter logWriter;
 
@@ -93,7 +71,7 @@ public class DataManager {
         DataManager manager = new DataManager();
 
         // 解析可选参数
-        String coordsFile = COORDS_FILE;
+        String coordsFile = null;
         for (int i = 0; i < args.length - 1; i++) {
             if ("--coords".equals(args[i])) coordsFile = args[i + 1];
             if ("--data-dir".equals(args[i])) DATA_BASE_DIR = args[i + 1];
@@ -142,19 +120,18 @@ public class DataManager {
         initLogWriter("import");
 
         log("================================================================================");
-        log("DataManager: Data Import");
+        log("DataManager: Data Import (High-Performance Two-Phase)");
         log("Time: " + LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-        log("DataType: " + dataType + ", Size: " + size);
+        log("DataType: " + dataType + ", Size: " + size + ", BatchSize: " + BATCH_SIZE);
         log("================================================================================");
 
         try {
             // Step 1: 加载坐标映射（batch 模式必须）
-            Map<Long, double[]> coordMap = null;
+            Map<Long, String> coordMap = null;   // sourceId -> "ra,dec"
             if ("batch".equals(dataType)) {
                 coordMap = loadCoordinates(coordsFile, size);
                 if (coordMap.isEmpty()) {
                     log("[ERROR] batch 模式需要坐标文件，但坐标为空");
-                    log("  请提供 --coords <file> 参数，文件格式: source_id,ra,dec");
                     return;
                 }
                 log("[坐标] 加载了 " + coordMap.size() + " 个天体的坐标");
@@ -169,98 +146,84 @@ public class DataManager {
 
             // Step 3: 初始化四个数据库系统
             log("\n--- 初始化数据库系统 ---");
-            String tdDbName = "astro_exp9_" + size;
 
-            // 3a. LitecsDB
             log("[LitecsDB] 初始化...");
             MainNode mainNode = new MainNode(NODE_COUNT, HEALPIX_LEVEL, LITECSDB_PATH);
 
-            // 3b. TDengine（per-source 子表模式）
             log("[TDengine] 初始化...");
-            Connection tdConn = createTDengineConnection();
-            initTDengineSchema(tdConn, tdDbName);
+            TDengineClientWrapper tdengine = new TDengineClientWrapper(TDENGINE_DB);
 
-            // 3c. InfluxDB
             log("[InfluxDB] 初始化...");
-            InfluxDBClientWrapper influxClient = new InfluxDBClientWrapper(INFLUX_BUCKET);
+            InfluxDBClientWrapper influxDB = new InfluxDBClientWrapper(INFLUX_BUCKET);
 
-            // 3d. NativeRocksDB
             log("[NativeRocksDB] 初始化...");
-            NativeRocksDBWrapper rocksdbClient = new NativeRocksDBWrapper(ROCKSDB_PATH);
+            NativeRocksDBWrapper nativeRocksDB = new NativeRocksDBWrapper(ROCKSDB_PATH);
 
-            // Step 4: 分批读取并写入
-            log("\n--- 开始数据导入 ---");
+            // Step 4: 两阶段写入
+            log("\n--- Phase 1: 预创建分区 + Phase 2: 批量写入 ---");
             long importStart = System.currentTimeMillis();
             long totalRows = 0;
 
-            // TDengine 写入连接池
-            final int TD_WRITE_THREADS = 16;
-            Connection[] tdWriteConns = new Connection[TD_WRITE_THREADS];
-            for (int i = 0; i < TD_WRITE_THREADS; i++) {
-                tdWriteConns[i] = createTDengineConnection();
-                tdWriteConns[i].createStatement().execute("USE " + tdDbName);
-            }
-            ExecutorService tdWritePool = Executors.newFixedThreadPool(TD_WRITE_THREADS);
-
-            // 已创建的 TDengine 子表集合
-            Set<Long> createdTDSubtables = ConcurrentHashMap.newKeySet();
-
+            // 累积大批量的 CSV 行缓冲区
+            List<String> csvBuffer = new ArrayList<>(BATCH_SIZE);
+            boolean phase1Done = false;
             int fileIdx = 0;
+
             for (File file : dataFiles) {
                 fileIdx++;
-                List<LightCurvePoint> batch = new ArrayList<>();
 
-                // 读取文件并解析
-                try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                try (BufferedReader reader = new BufferedReader(new FileReader(file), 1 << 16)) {
                     String line;
-                    boolean headerSkipped = false;
                     while ((line = reader.readLine()) != null) {
-                        if (!headerSkipped) {
-                            headerSkipped = true;
-                            if (line.startsWith("source_id")) continue;
-                        }
-                        try {
-                            LightCurvePoint point = parseLine(line, dataType, coordMap);
-                            if (point != null) {
-                                batch.add(point);
-                            }
-                        } catch (Exception e) {
-                            totalRowsFailed.incrementAndGet();
+                        if (line.isEmpty() || line.startsWith("source_id")) continue;
+
+                        // batch 模式：拼接坐标为 14 列格式
+                        if ("batch".equals(dataType)) {
+                            String joined = joinBatchLineWithCoords(line, coordMap);
+                            if (joined == null) { totalRowsFailed.incrementAndGet(); continue; }
+                            csvBuffer.add(joined);
+                        } else {
+                            // incremental 模式：已经是 14 列
+                            csvBuffer.add(line);
                         }
 
-                        // 达到批次大小时写入
-                        if (batch.size() >= WRITE_BATCH_SIZE) {
-                            writeBatchToAll(batch, mainNode, tdWriteConns, tdWritePool,
-                                    tdDbName, createdTDSubtables, influxClient, rocksdbClient);
-                            totalRows += batch.size();
-                            batch.clear();
+                        totalRows++;
+
+                        // 达到批量大小时执行写入
+                        if (csvBuffer.size() >= BATCH_SIZE) {
+                            if (!phase1Done) {
+                                executePhase1(csvBuffer, mainNode);
+                                phase1Done = true;
+                            }
+                            dispatchBatch(csvBuffer, mainNode, tdengine, influxDB, nativeRocksDB);
+                            csvBuffer.clear();
                         }
                     }
                 }
 
-                // 写入剩余数据
-                if (!batch.isEmpty()) {
-                    writeBatchToAll(batch, mainNode, tdWriteConns, tdWritePool,
-                            tdDbName, createdTDSubtables, influxClient, rocksdbClient);
-                    totalRows += batch.size();
-                    batch.clear();
-                }
-
-                // 每100个文件打印进度
-                if (fileIdx % 100 == 0 || fileIdx == dataFiles.size()) {
+                // 每20000个文件打印进度
+                if (fileIdx % 20000 == 0 || fileIdx == dataFiles.size()) {
                     double pct = (double) fileIdx / dataFiles.size() * 100;
                     long elapsed = System.currentTimeMillis() - importStart;
                     double rowsPerSec = totalRows * 1000.0 / Math.max(1, elapsed);
-                    log(String.format("  [进度] %d/%d 文件 (%.1f%%), 累计 %d 行, %.0f rows/s",
+                    log(String.format("  [进度] %d/%d 文件 (%.1f%%), 累计 %,d 行, %.0f rows/s",
                             fileIdx, dataFiles.size(), pct, totalRows, rowsPerSec));
                 }
             }
 
+            // 写入剩余数据
+            if (!csvBuffer.isEmpty()) {
+                if (!phase1Done) {
+                    executePhase1(csvBuffer, mainNode);
+                }
+                dispatchBatch(csvBuffer, mainNode, tdengine, influxDB, nativeRocksDB);
+                csvBuffer.clear();
+            }
+
             long importDuration = System.currentTimeMillis() - importStart;
-            log(String.format("\n[导入完成] 共 %d 行, 耗时 %.1f 秒, 速率 %.0f rows/s",
+            log(String.format("\n[导入完成] 共 %,d 行, 耗时 %.1f 秒, 速率 %.0f rows/s",
                     totalRows, importDuration / 1000.0, totalRows * 1000.0 / importDuration));
             log("  失败行数: " + totalRowsFailed.get());
-            log("  TDengine 子表数: " + createdTDSubtables.size());
 
             // Step 5: Flush 所有系统
             log("\n--- Flush 数据到磁盘 ---");
@@ -269,20 +232,19 @@ public class DataManager {
             mainNode.forceFlushAllNoCompaction();
 
             log("[TDengine] Flushing...");
-            try (Statement stmt = tdConn.createStatement()) {
-                stmt.execute("FLUSH DATABASE " + tdDbName);
-            }
+            tdengine.forceFlush();
 
             log("[InfluxDB] Flushing...");
-            influxClient.forceFlush();
+            influxDB.forceFlush();
 
             log("[NativeRocksDB] Flushing...");
-            rocksdbClient.forceFlush();
+            nativeRocksDB.forceFlush();
+
+            try { Thread.sleep(5000); } catch (InterruptedException e) {}
 
             // Step 6: 构建索引
             log("\n--- 构建索引 ---");
 
-            // 6a. LitecsDB: 构建 DP 自适应时间桶索引
             log("[LitecsDB] 构建时间桶索引 (DP 自适应分桶)...");
             long idxStart = System.currentTimeMillis();
             mainNode.setTimeBucketDPParams(0.6, 10.0);
@@ -290,43 +252,28 @@ public class DataManager {
             log("[LitecsDB] 时间桶索引构建完成, 耗时 " +
                     (System.currentTimeMillis() - idxStart) + " ms");
 
-            // Compact LitecsDB
             log("[LitecsDB] Compaction...");
             mainNode.compactOnly();
 
-            // 6b. TDengine: 子表 TAG 索引由引擎自动维护
-            //     per-source 子表的 TAG (source_id, ra, dec_val) 已在写入时创建
-            //     TDengine 自动为 TAG 建立索引，无需额外操作
-            log("[TDengine] TAG 索引已自动维护（per-source 子表模式）");
+            log("[TDengine] TAG 索引已自动维护");
+            log("[InfluxDB] TSI 索引已自动构建");
 
-            // 6c. InfluxDB: TSI (Time Series Index) 由引擎自动构建
-            //     基于 source_id 和 band 两个 tag 的索引在写入时自动更新
-            //     强制等待 TSI compaction 完成
-            log("[InfluxDB] TSI 索引已自动构建，等待 compaction 完成...");
-            try { Thread.sleep(5000); } catch (InterruptedException e) {}
-
-            // 6d. NativeRocksDB: 执行全量 compaction，构建 LSM 树索引
-            log("[NativeRocksDB] 执行全量 compaction（构建 LSM 索引）...");
+            log("[NativeRocksDB] 执行全量 compaction...");
             idxStart = System.currentTimeMillis();
-            rocksdbClient.forceFlush();  // flush + compactRange
+            nativeRocksDB.forceFlush();
             log("[NativeRocksDB] compaction 完成, 耗时 " +
                     (System.currentTimeMillis() - idxStart) + " ms");
 
             // Step 7: 验证
             log("\n--- 导入验证 ---");
-            verifyImport(mainNode, tdConn, tdDbName, influxClient, rocksdbClient);
+            verifyImport(mainNode, totalRows);
 
             // Step 8: 关闭资源
             log("\n--- 关闭资源 ---");
             mainNode.shutdown();
-            tdWritePool.shutdown();
-            tdWritePool.awaitTermination(60, TimeUnit.SECONDS);
-            for (Connection c : tdWriteConns) {
-                try { if (c != null) c.close(); } catch (Exception e) {}
-            }
-            tdConn.close();
-            influxClient.close();
-            rocksdbClient.close();
+            tdengine.close();
+            influxDB.close();
+            nativeRocksDB.close();
 
             log("\n[完成] 数据导入与索引构建全部完成");
 
@@ -336,6 +283,127 @@ public class DataManager {
         } finally {
             closeLogWriter();
         }
+    }
+
+    // ==================== 两阶段策略核心 ====================
+
+    /**
+     * Phase 1: 预创建 LitecsDB 的 HEALPix 分区（不计入写入时间）
+     *
+     * 对齐 Experiment1Runner.executePhase1PreCreate：
+     *   扫描样本数据提取 healpixId → 并行预创建 RocksDB 实例
+     *   TDengine/NativeRocksDB/InfluxDB 的分区已在初始化时创建
+     */
+    private void executePhase1(List<String> sampleBatch, MainNode mainNode) {
+        log("\n  Phase 1: 预创建 HEALPix 分区...");
+        long start = System.currentTimeMillis();
+        int preCreated = mainNode.preCreateHealpixDatabases(sampleBatch);
+        log(String.format("  LitecsDB: 预创建 %d 个 HEALPix 分区, 耗时 %d ms",
+                preCreated, System.currentTimeMillis() - start));
+        log("  TDengine/NativeRocksDB/InfluxDB: 分区已在初始化时创建");
+        log("  Phase 1 完成，开始 Phase 2: 批量写入\n");
+    }
+
+    /**
+     * Phase 2: 批量写入四个系统
+     *
+     * 对齐 Experiment1Runner.dispatchBatch：
+     *   1. CSV 只解析一次 → List<LightCurvePoint> (所有系统共用)
+     *   2. LitecsDB 额外按 healpixId 分组 → Map<Long, List<LightCurvePoint>>
+     *   3. 顺序写入各系统（每个系统内部已有 16 线程并行写入）
+     *      不使用外层 4 线程并行，避免线程协调开销和资源争抢
+     */
+    private void dispatchBatch(List<String> csvLines,
+                               MainNode mainNode,
+                               TDengineClientWrapper tdengine,
+                               InfluxDBClientWrapper influxDB,
+                               NativeRocksDBWrapper nativeRocksDB) {
+
+        // ===== 预解析（不计入任何系统的写入时间） =====
+        // 1. 解析为 LightCurvePoint 列表（通用，所有系统复用）
+        List<LightCurvePoint> parsedPoints = parseLines(csvLines);
+
+        // 2. LitecsDB 专用：按 healpixId 分组（直接从已解析对象分组，不经 CSV）
+        Map<Long, List<LightCurvePoint>> healpixGrouped = groupByHealpix(parsedPoints, mainNode);
+
+        // ===== 以下是写入（顺序执行，每个系统内部多线程并行） =====
+
+        // 1. LitecsDB
+        mainNode.distributePreParsedData(healpixGrouped);
+
+        // 2. TDengine（内部 16 线程 hash 分桶并行写入）
+        tdengine.putBatch(parsedPoints);
+
+        // 3. InfluxDB（内部 16 线程 line protocol 并行写入）
+        influxDB.putBatch(parsedPoints);
+
+        // 4. NativeRocksDB（内部 16 线程 CF 并行写入）
+        nativeRocksDB.putBatch(parsedPoints);
+    }
+
+    /**
+     * 直接将已解析的 LightCurvePoint 按 healpixId 分组
+     *
+     * 关键优化：跳过 CSV 重解析，直接用 calculateHealpixId 计算分区 ID
+     */
+    private Map<Long, List<LightCurvePoint>> groupByHealpix(
+            List<LightCurvePoint> points, MainNode mainNode) {
+        Map<Long, List<LightCurvePoint>> map = new HashMap<>();
+        for (LightCurvePoint p : points) {
+            long healpixId = mainNode.calculateHealpixId(p.ra, p.dec);
+            map.computeIfAbsent(healpixId, k -> new ArrayList<>()).add(p);
+        }
+        return map;
+    }
+
+    // ==================== 数据解析 ====================
+
+    /**
+     * Batch 模式：将 12 列 CSV 行拼接坐标变成 14 列
+     * 对齐 Experiment1Runner.runBatchTest 的坐标拼接逻辑
+     */
+    private String joinBatchLineWithCoords(String line, Map<Long, String> coordMap) {
+        try {
+            int firstComma = line.indexOf(',');
+            if (firstComma < 0) return null;
+            long sourceId = Long.parseLong(line.substring(0, firstComma).trim());
+            String coords = coordMap.getOrDefault(sourceId, "0.0,0.0");
+            return line.substring(0, firstComma) + "," + coords + "," + line.substring(firstComma + 1);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 解析 14 列 CSV → LightCurvePoint
+     * 完全对齐 Experiment1Runner.parseLines
+     */
+    private static List<LightCurvePoint> parseLines(List<String> csvLines) {
+        List<LightCurvePoint> points = new ArrayList<>(csvLines.size());
+        for (String line : csvLines) {
+            try {
+                if (line == null || line.isEmpty()) continue;
+                String[] parts = line.split(",", -1);
+                if (parts.length < 14 || "source_id".equals(parts[0].trim())) continue;
+                points.add(new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0].trim()),
+                        Double.parseDouble(parts[1].trim()),
+                        Double.parseDouble(parts[2].trim()),
+                        (long) Double.parseDouble(parts[3].trim()),
+                        parts[4].trim(),
+                        Double.parseDouble(parts[5].trim()),
+                        Double.parseDouble(parts[6].trim()),
+                        Double.parseDouble(parts[7].trim()),
+                        Double.parseDouble(parts[8].trim()),
+                        Double.parseDouble(parts[9].trim()),
+                        Boolean.parseBoolean(parts[10].trim()),
+                        Boolean.parseBoolean(parts[11].trim()),
+                        (int) Double.parseDouble(parts[12].trim()),
+                        (long) Double.parseDouble(parts[13].trim())
+                ));
+            } catch (Exception ignored) {}
+        }
+        return points;
     }
 
     // ==================== 删除流程 ====================
@@ -363,25 +431,30 @@ public class DataManager {
 
         // 2. 删除 TDengine
         log("\n[TDengine] 删除数据...");
-        try (Connection conn = createTDengineConnection();
-             Statement stmt = conn.createStatement()) {
-            // 查找并删除所有 astro_exp9_ 开头的数据库
-            ResultSet rs = stmt.executeQuery("SHOW DATABASES");
-            List<String> dbsToDelete = new ArrayList<>();
-            while (rs.next()) {
-                String name = rs.getString(1);
-                if (name.startsWith("astro_exp9_") || name.equals("astro_db")) {
-                    dbsToDelete.add(name);
-                }
-            }
-            rs.close();
+        try {
+            String host = System.getenv().getOrDefault("TDENGINE_HOST", "127.0.0.1");
+            int port = Integer.parseInt(System.getenv().getOrDefault("TDENGINE_PORT", "6030"));
+            String url = String.format("jdbc:TAOS://%s:%d/?charset=UTF-8", host, port);
+            Properties props = new Properties();
+            props.setProperty("user", System.getenv().getOrDefault("TDENGINE_USER", "root"));
+            props.setProperty("password", System.getenv().getOrDefault("TDENGINE_PASSWORD", "taosdata"));
 
-            for (String db : dbsToDelete) {
-                stmt.execute("DROP DATABASE IF EXISTS " + db);
-                log("  已删除数据库: " + db);
-            }
-            if (dbsToDelete.isEmpty()) {
-                log("  无数据库需要删除");
+            try (Connection conn = DriverManager.getConnection(url, props);
+                 Statement stmt = conn.createStatement()) {
+                ResultSet rs = stmt.executeQuery("SHOW DATABASES");
+                List<String> dbsToDelete = new ArrayList<>();
+                while (rs.next()) {
+                    String name = rs.getString(1);
+                    if (name.startsWith("astro_exp9") || name.equals("astro_db")) {
+                        dbsToDelete.add(name);
+                    }
+                }
+                rs.close();
+                for (String db : dbsToDelete) {
+                    stmt.execute("DROP DATABASE IF EXISTS " + db);
+                    log("  已删除数据库: " + db);
+                }
+                if (dbsToDelete.isEmpty()) log("  无数据库需要删除");
             }
         } catch (Exception e) {
             log("  TDengine 删除失败: " + e.getMessage());
@@ -416,317 +489,21 @@ public class DataManager {
         closeLogWriter();
     }
 
-    // ==================== 数据解析 ====================
-
-    /**
-     * 解析一行 CSV 数据为 LightCurvePoint
-     *
-     * @param line     CSV 行
-     * @param dataType "batch" (12列) 或 "incremental" (14列)
-     * @param coordMap batch 模式的坐标映射 (source_id -> [ra, dec])
-     */
-    private LightCurvePoint parseLine(String line, String dataType, Map<Long, double[]> coordMap) {
-        String[] parts = line.split(",", -1);
-
-        if ("incremental".equals(dataType)) {
-            // 14列格式: source_id,ra,dec,transit_id,band,time,mag,...
-            if (parts.length < 14) return null;
-            return new LightCurvePoint(
-                    (long) Double.parseDouble(parts[0].trim()),  // source_id
-                    Double.parseDouble(parts[1].trim()),          // ra
-                    Double.parseDouble(parts[2].trim()),          // dec
-                    (long) Double.parseDouble(parts[3].trim()),  // transit_id
-                    parts[4].trim(),                              // band
-                    Double.parseDouble(parts[5].trim()),          // time
-                    Double.parseDouble(parts[6].trim()),          // mag
-                    Double.parseDouble(parts[7].trim()),          // flux
-                    Double.parseDouble(parts[8].trim()),          // flux_error
-                    Double.parseDouble(parts[9].trim()),          // flux_over_error
-                    Boolean.parseBoolean(parts[10].trim()),       // rejected_by_photometry
-                    Boolean.parseBoolean(parts[11].trim()),       // rejected_by_variability
-                    (int) Double.parseDouble(parts[12].trim()),  // other_flags
-                    (long) Double.parseDouble(parts[13].trim())  // solution_id
-            );
-        } else {
-            // batch 12列格式: source_id,transit_id,band,time,mag,...
-            if (parts.length < 12) return null;
-            long sourceId = (long) Double.parseDouble(parts[0].trim());
-
-            // 从坐标映射查找 ra/dec
-            double ra = 0.0, dec = 0.0;
-            if (coordMap != null) {
-                double[] coord = coordMap.get(sourceId);
-                if (coord != null) {
-                    ra = coord[0];
-                    dec = coord[1];
-                }
-            }
-
-            return new LightCurvePoint(
-                    sourceId,                                     // source_id
-                    ra, dec,                                      // ra, dec (from coord map)
-                    (long) Double.parseDouble(parts[1].trim()),  // transit_id
-                    parts[2].trim(),                              // band
-                    Double.parseDouble(parts[3].trim()),          // time
-                    Double.parseDouble(parts[4].trim()),          // mag
-                    Double.parseDouble(parts[5].trim()),          // flux
-                    Double.parseDouble(parts[6].trim()),          // flux_error
-                    Double.parseDouble(parts[7].trim()),          // flux_over_error
-                    Boolean.parseBoolean(parts[8].trim()),        // rejected_by_photometry
-                    Boolean.parseBoolean(parts[9].trim()),        // rejected_by_variability
-                    (int) Double.parseDouble(parts[10].trim()),  // other_flags
-                    (long) Double.parseDouble(parts[11].trim())  // solution_id
-            );
-        }
-    }
-
-    // ==================== 批量写入 ====================
-
-    /**
-     * 将一批数据同时写入四个数据库系统
-     */
-    private void writeBatchToAll(List<LightCurvePoint> batch,
-                                 MainNode mainNode,
-                                 Connection[] tdWriteConns,
-                                 ExecutorService tdWritePool,
-                                 String tdDbName,
-                                 Set<Long> createdTDSubtables,
-                                 InfluxDBClientWrapper influxClient,
-                                 NativeRocksDBWrapper rocksdbClient) {
-
-        List<LightCurvePoint> batchCopy = new ArrayList<>(batch);
-
-        // 四个系统并行写入
-        CountDownLatch latch = new CountDownLatch(4);
-
-        // 1. LitecsDB: 通过 MainNode 分发
-        Thread litecsThread = new Thread(() -> {
-            try {
-                Map<Long, List<LightCurvePoint>> healpixMap = mainNode.preParseData(
-                        batchCopy.stream()
-                                .map(this::toLitecsCSV)
-                                .collect(Collectors.toList()));
-                mainNode.distributePreParsedData(healpixMap);
-            } catch (Exception e) {
-                System.err.println("[LitecsDB] 写入失败: " + e.getMessage());
-            } finally {
-                latch.countDown();
-            }
-        }, "LitecsDB-Writer");
-        litecsThread.start();
-
-        // 2. TDengine: per-source 子表写入
-        Thread tdThread = new Thread(() -> {
-            try {
-                writeBatchToTDengine(batchCopy, tdWriteConns, tdWritePool,
-                        tdDbName, createdTDSubtables);
-            } catch (Exception e) {
-                System.err.println("[TDengine] 写入失败: " + e.getMessage());
-            } finally {
-                latch.countDown();
-            }
-        }, "TDengine-Writer");
-        tdThread.start();
-
-        // 3. InfluxDB
-        Thread influxThread = new Thread(() -> {
-            try {
-                influxClient.putBatch(batchCopy);
-            } catch (Exception e) {
-                System.err.println("[InfluxDB] 写入失败: " + e.getMessage());
-            } finally {
-                latch.countDown();
-            }
-        }, "InfluxDB-Writer");
-        influxThread.start();
-
-        // 4. NativeRocksDB
-        Thread rocksThread = new Thread(() -> {
-            try {
-                rocksdbClient.putBatch(batchCopy);
-            } catch (Exception e) {
-                System.err.println("[NativeRocksDB] 写入失败: " + e.getMessage());
-            } finally {
-                latch.countDown();
-            }
-        }, "NativeRocksDB-Writer");
-        rocksThread.start();
-
-        try {
-            latch.await(300, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    /**
-     * 将 LightCurvePoint 转为 LitecsDB 需要的 14 列 CSV
-     * (source_id,ra,dec,transit_id,band,time,mag,flux,flux_error,flux_over_error,
-     *  rejected_by_photometry,rejected_by_variability,other_flags,solution_id)
-     */
-    private String toLitecsCSV(LightCurvePoint p) {
-        return String.format(Locale.US,
-                "%d,%.6f,%.6f,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%s,%s,%d,%d",
-                p.sourceId, p.ra, p.dec, p.transitId, p.band, p.time, p.mag,
-                p.flux, p.fluxError, p.fluxOverError,
-                p.rejectedByPhotometry, p.rejectedByVariability,
-                p.otherFlags, p.solutionId);
-    }
-
-    // ==================== TDengine 写入 ====================
-
-    /**
-     * 初始化 TDengine schema（per-source 子表模式）
-     *
-     * 超级表结构不变，但子表按 source_id 创建（不再是 hash 分桶），
-     * 每张子表的 TAGS 携带真实的 source_id, ra, dec_val。
-     */
-    private void initTDengineSchema(Connection conn, String dbName) throws SQLException {
-        try (Statement stmt = conn.createStatement()) {
-            stmt.execute("DROP DATABASE IF EXISTS " + dbName);
-            log("  已清理残留数据库: " + dbName);
-
-            stmt.execute(String.format(
-                    "CREATE DATABASE IF NOT EXISTS %s " +
-                            "VGROUPS %d " +
-                            "BUFFER 256 " +
-                            "WAL_LEVEL 1 " +
-                            "WAL_FSYNC_PERIOD 3000 " +
-                            "PAGES 256 " +
-                            "PRECISION 'us'",
-                    dbName, TDENGINE_VGROUPS));
-
-            stmt.execute("USE " + dbName);
-
-            // 超级表：数据列 + TAG
-            stmt.execute(
-                    "CREATE STABLE IF NOT EXISTS lightcurve (" +
-                            "  ts TIMESTAMP, " +
-                            "  transit_id BIGINT, " +
-                            "  band NCHAR(4), " +
-                            "  obs_time DOUBLE, " +
-                            "  mag DOUBLE, " +
-                            "  flux DOUBLE, " +
-                            "  flux_error DOUBLE, " +
-                            "  flux_over_error DOUBLE, " +
-                            "  rejected_by_photometry BOOL, " +
-                            "  rejected_by_variability BOOL, " +
-                            "  other_flags INT, " +
-                            "  solution_id BIGINT" +
-                            ") TAGS (" +
-                            "  source_id BIGINT, " +
-                            "  ra DOUBLE, " +
-                            "  dec_val DOUBLE" +
-                            ")");
-
-            log("  TDengine 超级表创建完成 (per-source 子表模式)");
-        }
-    }
-
-    /**
-     * 批量写入 TDengine（per-source 子表）
-     *
-     * 对每个 source_id：
-     *   1. 若子表不存在，CREATE TABLE IF NOT EXISTS s_{sourceId} USING lightcurve TAGS(...)
-     *   2. INSERT INTO s_{sourceId} VALUES (...)
-     */
-    private void writeBatchToTDengine(List<LightCurvePoint> points,
-                                      Connection[] conns,
-                                      ExecutorService pool,
-                                      String dbName,
-                                      Set<Long> createdSubtables) {
-        // 按 source_id 分组
-        Map<Long, List<LightCurvePoint>> bySource = new HashMap<>();
-        for (LightCurvePoint p : points) {
-            bySource.computeIfAbsent(p.sourceId, k -> new ArrayList<>()).add(p);
-        }
-
-        // 分配到多个线程
-        int numConns = conns.length;
-        List<Map.Entry<Long, List<LightCurvePoint>>> entries = new ArrayList<>(bySource.entrySet());
-        int chunkSize = Math.max(1, (entries.size() + numConns - 1) / numConns);
-
-        CountDownLatch latch = new CountDownLatch(
-                Math.min(numConns, (entries.size() + chunkSize - 1) / chunkSize));
-
-        for (int t = 0; t < numConns && t * chunkSize < entries.size(); t++) {
-            final int threadIdx = t;
-            final int start = t * chunkSize;
-            final int end = Math.min(start + chunkSize, entries.size());
-
-            pool.submit(() -> {
-                try {
-                    Connection conn = conns[threadIdx];
-                    for (int i = start; i < end; i++) {
-                        Map.Entry<Long, List<LightCurvePoint>> entry = entries.get(i);
-                        long sourceId = entry.getKey();
-                        List<LightCurvePoint> srcPoints = entry.getValue();
-
-                        // 创建子表（如果还没创建）
-                        if (createdSubtables.add(sourceId)) {
-                            double ra = srcPoints.get(0).ra;
-                            double dec = srcPoints.get(0).dec;
-                            String createSql = String.format(Locale.US,
-                                    "CREATE TABLE IF NOT EXISTS %s.s_%d USING %s.lightcurve TAGS(%d, %.6f, %.6f)",
-                                    dbName, sourceId, dbName, sourceId, ra, dec);
-                            try (Statement stmt = conn.createStatement()) {
-                                stmt.execute(createSql);
-                            }
-                        }
-
-                        // 批量插入
-                        StringBuilder sql = new StringBuilder();
-                        sql.append("INSERT INTO ").append(dbName).append(".s_").append(sourceId).append(" VALUES ");
-
-                        for (int j = 0; j < srcPoints.size(); j++) {
-                            LightCurvePoint p = srcPoints.get(j);
-                            long tsUs = GAIA_EPOCH_UNIX_US + (long) (p.time * US_PER_DAY)
-                                    + Math.abs(p.transitId % 999_000);
-
-                            if (j > 0) sql.append(" ");
-                            sql.append(String.format(Locale.US,
-                                    "(%d,%d,'%s',%.6f,%.6f,%.6f,%.6f,%.6f,%s,%s,%d,%d)",
-                                    tsUs, p.transitId, p.band, p.time, p.mag,
-                                    p.flux, p.fluxError, p.fluxOverError,
-                                    p.rejectedByPhotometry ? "true" : "false",
-                                    p.rejectedByVariability ? "true" : "false",
-                                    p.otherFlags, p.solutionId));
-                        }
-
-                        try (Statement stmt = conn.createStatement()) {
-                            stmt.execute(sql.toString());
-                        }
-                    }
-                } catch (Exception e) {
-                    System.err.println("TDengine write thread " + threadIdx + " failed: " + e.getMessage());
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
-
-        try { latch.await(120, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-    }
-
     // ==================== 坐标加载 ====================
 
     /**
-     * 加载坐标映射文件
-     * 搜索顺序：
-     *   1. 用户指定的 --coords 文件
-     *   2. generated_datasets/batch_{size}/star_coordinates.csv
-     *   3. generated_datasets/batch_{size}/gaia_source_coordinates.csv
-     *   4. 从同规模增量数据集中提取坐标
+     * 加载坐标映射（对齐 Experiment1Runner 的 coordsMap 格式）
+     * 存储格式：sourceId -> "ra,dec" （字符串拼接，避免后续格式化开销）
      */
-    private Map<Long, double[]> loadCoordinates(String coordsFile, String size) {
-        Map<Long, double[]> coordMap = new HashMap<>();
+    private Map<Long, String> loadCoordinates(String coordsFile, String size) {
+        Map<Long, String> coordMap = new HashMap<>();
 
-        // 候选坐标文件列表
         List<String> candidates = new ArrayList<>();
         if (coordsFile != null) candidates.add(coordsFile);
+        candidates.add(DATA_BASE_DIR + "batch_" + size + "/source_coordinates.csv");
         candidates.add(DATA_BASE_DIR + "batch_" + size + "/star_coordinates.csv");
         candidates.add(DATA_BASE_DIR + "batch_" + size + "/gaia_source_coordinates.csv");
-        candidates.add(DATA_BASE_DIR + "star_coordinates.csv");
+        candidates.add(DATA_BASE_DIR + "source_coordinates.csv");
 
         for (String path : candidates) {
             File f = new File(path);
@@ -738,10 +515,8 @@ public class DataManager {
                         if (line.startsWith("source_id") || line.startsWith("#")) continue;
                         String[] parts = line.split(",");
                         if (parts.length >= 3) {
-                            long sourceId = (long) Double.parseDouble(parts[0].trim());
-                            double ra = Double.parseDouble(parts[1].trim());
-                            double dec = Double.parseDouble(parts[2].trim());
-                            coordMap.put(sourceId, new double[]{ra, dec});
+                            long sourceId = Long.parseLong(parts[0].trim());
+                            coordMap.put(sourceId, parts[1].trim() + "," + parts[2].trim());
                         }
                     }
                 } catch (IOException e) {
@@ -751,24 +526,21 @@ public class DataManager {
             }
         }
 
-        // 回退：尝试从增量数据集提取坐标
+        // 回退：从增量数据集提取
         String incrDir = DATA_BASE_DIR + "incremental_" + size + "/observation_records_by_time/";
         File incrDirFile = new File(incrDir);
         if (incrDirFile.exists()) {
             log("[坐标] 从增量数据集提取坐标: " + incrDir);
             File[] incrFiles = incrDirFile.listFiles((dir, name) -> name.endsWith(".csv"));
             if (incrFiles != null && incrFiles.length > 0) {
-                // 只需要读第一个文件（包含所有天体的快照）
                 try (BufferedReader reader = new BufferedReader(new FileReader(incrFiles[0]))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         if (line.startsWith("source_id")) continue;
                         String[] parts = line.split(",", 4);
                         if (parts.length >= 3) {
-                            long sourceId = (long) Double.parseDouble(parts[0].trim());
-                            double ra = Double.parseDouble(parts[1].trim());
-                            double dec = Double.parseDouble(parts[2].trim());
-                            coordMap.putIfAbsent(sourceId, new double[]{ra, dec});
+                            long sourceId = Long.parseLong(parts[0].trim());
+                            coordMap.putIfAbsent(sourceId, parts[1].trim() + "," + parts[2].trim());
                         }
                     }
                 } catch (IOException e) {
@@ -776,7 +548,6 @@ public class DataManager {
                 }
             }
         }
-
         return coordMap;
     }
 
@@ -789,7 +560,6 @@ public class DataManager {
         } else {
             dir = DATA_BASE_DIR + "incremental_" + size + "/observation_records_by_time/";
         }
-
         File dirFile = new File(dir);
         if (!dirFile.exists() || !dirFile.isDirectory()) {
             log("[ERROR] 数据目录不存在: " + dir);
@@ -803,56 +573,26 @@ public class DataManager {
         File dir = new File(dataDir);
         File[] files;
         if ("batch".equals(dataType)) {
-            files = dir.listFiles((d, name) -> name.startsWith("lightcurve_") && name.endsWith(".csv"));
+            files = dir.listFiles((d, name) -> name.endsWith(".csv"));
         } else {
             files = dir.listFiles((d, name) -> name.startsWith("time_") && name.endsWith(".csv"));
         }
         if (files == null) return Collections.emptyList();
-
         List<File> fileList = Arrays.asList(files);
-        // 排序确保确定性
         fileList.sort(Comparator.comparing(File::getName));
         return fileList;
     }
 
-    // ==================== 导入验证 ====================
+    // ==================== 验证 ====================
 
-    private void verifyImport(MainNode mainNode, Connection tdConn, String tdDbName,
-                              InfluxDBClientWrapper influx, NativeRocksDBWrapper rocksdb) {
-        // LitecsDB
+    private void verifyImport(MainNode mainNode, long expectedRows) {
         try {
             List<StarMetadata> stars = mainNode.getAllStarsMetadata();
-            log(String.format("  LitecsDB:     %d 个天体", stars.size()));
+            log(String.format("  LitecsDB:      %d 个天体", stars.size()));
         } catch (Exception e) {
-            log("  LitecsDB:     验证失败 - " + e.getMessage());
+            log("  LitecsDB:      验证失败 - " + e.getMessage());
         }
-
-        // TDengine
-        try (Statement stmt = tdConn.createStatement();
-             ResultSet rs = stmt.executeQuery(
-                     "SELECT COUNT(*) FROM " + tdDbName + ".lightcurve")) {
-            if (rs.next()) {
-                log(String.format("  TDengine:     %d 行", rs.getLong(1)));
-            }
-        } catch (Exception e) {
-            log("  TDengine:     验证失败 - " + e.getMessage());
-        }
-
-        // InfluxDB (行数难以精确统计，跳过)
-        log("  InfluxDB:     写入完成 (bucket=" + INFLUX_BUCKET + ")");
-
-        // NativeRocksDB (行数统计需要全量扫描，跳过)
-        log("  NativeRocksDB: 写入完成");
-    }
-
-    // ==================== TDengine 连接 ====================
-
-    private Connection createTDengineConnection() throws SQLException {
-        String url = String.format("jdbc:TAOS://%s:%d/?charset=UTF-8", TDENGINE_HOST, TDENGINE_PORT);
-        Properties props = new Properties();
-        props.setProperty("user", TDENGINE_USER);
-        props.setProperty("password", TDENGINE_PASSWORD);
-        return DriverManager.getConnection(url, props);
+        log(String.format("  预期总行数:     %,d", expectedRows));
     }
 
     // ==================== 工具方法 ====================
@@ -861,9 +601,7 @@ public class DataManager {
         if (dir.isDirectory()) {
             File[] children = dir.listFiles();
             if (children != null) {
-                for (File child : children) {
-                    deleteDirectory(child);
-                }
+                for (File child : children) deleteDirectory(child);
             }
         }
         dir.delete();
