@@ -68,8 +68,8 @@ public class MainNode {
 //            System.out.println("Node " + nodeId + ": no existing databases found");
             return;
         }
-        System.out.println("Node " + nodeId + ": found " + healpixDirs.length +
-                " existing HEALPix databases, loading in parallel...");
+//        System.out.println("Node " + nodeId + ": found " + healpixDirs.length +
+//                " existing HEALPix databases, loading in parallel...");
         long startTime = System.currentTimeMillis();
         Arrays.stream(healpixDirs).parallel().forEach(healpixDir -> {
             try {
@@ -525,6 +525,13 @@ public class MainNode {
         }
 
         return stats;
+    }
+
+    public List<LightCurvePoint> getLightCurveFromPartition(
+            long healpixId, long sourceId, String band) {
+        StorageNode node = storageNodes.get((int) (healpixId % nodesCount));
+        if (node == null) return Collections.emptyList();
+        return node.getLightCurve(healpixId, sourceId, band);
     }
 
     /** 详细桶统计（含桶大小标准差） */

@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class TDengineClientWrapper implements AutoCloseable {
     private static final int HEALPIX_LEVEL = 1;
     private static final int WRITE_THREADS = 16;
-    private static final int QUERY_THREADS = 8;
+    private static final int QUERY_THREADS = 32;
     private static final int BATCH_SIZE = 10_000;
     private static final int VGROUPS = 32;
     private final String database;
@@ -56,8 +56,7 @@ public class TDengineClientWrapper implements AutoCloseable {
     }
     private void initDatabase() throws SQLException {
         try (Connection c = createConn(); Statement s = c.createStatement()) {
-            s.execute("DROP DATABASE IF EXISTS " + database);
-            s.execute(String.format("CREATE DATABASE IF NOT EXISTS %s VGROUPS %d BUFFER 256 WAL_LEVEL 1 WAL_FSYNC_PERIOD 3000 PAGES 256 PRECISION 'us'", database, VGROUPS));
+            s.execute(String.format("CREATE DATABASE IF NOT EXISTS %s VGROUPS %d BUFFER 256 WAL_LEVEL 1 WAL_FSYNC_PERIOD 3000 PAGES 1024 PAGESIZE 16 CACHESIZE 128 CACHEMODEL 'both' PRECISION 'us'", database, VGROUPS));
         }
     }
     private void ensureStable(Statement stmt, long hpid) throws SQLException {
@@ -121,52 +120,230 @@ public class TDengineClientWrapper implements AutoCloseable {
         }
     }
 
-    public void clearQueryCache() {
-        try {
-            for (int i = 0; i < QUERY_THREADS; i++) { if (queryConnections[i]!=null) try{queryConnections[i].close();}catch(Exception e){} queryConnections[i]=createConn(); queryConnections[i].createStatement().execute("USE "+database); }
-            try(Connection c=createConn();Statement s=c.createStatement()){s.execute("RESET QUERY CACHE");}catch(Exception e){}
+    // ==================== 单条直接查询接口（无线程池开销） ====================
+
+    /** 单条简单查询，返回行数 */
+    public int querySingle(long sourceId, double ra, double dec) {
+        long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+        String sql = String.format("SELECT ts FROM %s.hp_%d WHERE source_id=%d ORDER BY ts", database, hpid, sourceId);
+        int rowCount = 0;
+        try (Statement stmt = queryConnections[0].createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) rowCount++;
         } catch (Exception e) {}
+        return rowCount;
     }
 
-    public List<LightCurvePoint> executeSimpleQuery(long sourceId) {
-        List<LightCurvePoint> rows = new ArrayList<>();
-        for (long hpid : createdStables) {
-            String sql = String.format("SELECT ts,source_id,ra,dec_val,band,transit_id,obs_time,mag,flux,flux_error,flux_over_error,rejected_by_photometry,rejected_by_variability,other_flags,solution_id FROM %s.hp_%d WHERE source_id=%d ORDER BY ts", database, hpid, sourceId);
-            try (Statement stmt = queryConnections[0].createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
-                while (rs.next()) rows.add(new LightCurvePoint(rs.getLong("source_id"),rs.getDouble("ra"),rs.getDouble("dec_val"),rs.getLong("transit_id"),rs.getString("band").trim(),rs.getDouble("obs_time"),rs.getDouble("mag"),rs.getDouble("flux"),rs.getDouble("flux_error"),rs.getDouble("flux_over_error"),rs.getBoolean("rejected_by_photometry"),rs.getBoolean("rejected_by_variability"),rs.getInt("other_flags"),rs.getLong("solution_id")));
-            } catch (SQLException e) {}
-            if (!rows.isEmpty()) break;
-        }
-        return rows;
-    }
-
-    public List<Long> executeSTMKQuery(double ra, double dec, double radius, double startTime, double endTime, double magMin, double magMax, int minObs) {
+    /** 单条时间范围查询 */
+    public int queryTimeRange(long sourceId, double ra, double dec, double startTime, double endTime) {
+        long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
         long startUs = (GAIA_EPOCH_UNIX_MS + (long)(startTime * MS_PER_DAY)) * 1000;
         long endUs = (GAIA_EPOCH_UNIX_MS + (long)(endTime * MS_PER_DAY)) * 1000;
-        Set<Long> targetHpids = calcHealpixCone(ra, dec, radius);
-        if (targetHpids.isEmpty()) return Collections.emptyList();
-        List<Long> matched = Collections.synchronizedList(new ArrayList<>());
-        CountDownLatch latch = new CountDownLatch(targetHpids.size());
-        for (long hpid : targetHpids) {
+        String sql = String.format("SELECT ts FROM %s.hp_%d WHERE source_id=%d AND ts>=%d AND ts<=%d",
+                database, hpid, sourceId, startUs, endUs);
+        int rowCount = 0;
+        try (Statement stmt = queryConnections[0].createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) rowCount++;
+        } catch (Exception e) {}
+        return rowCount;
+    }
+
+    /** 单条聚合查询 */
+    public double[] queryAggregation(long sourceId, double ra, double dec) {
+        long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+        String sql = String.format("SELECT COUNT(*),AVG(mag),MIN(mag),MAX(mag) FROM %s.hp_%d WHERE source_id=%d",
+                database, hpid, sourceId);
+        try (Statement stmt = queryConnections[0].createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+            if (rs.next()) return new double[]{rs.getDouble(1), rs.getDouble(2)};
+        } catch (Exception e) {}
+        return new double[]{0, 0};
+    }
+
+    /** 单条波段查询 */
+    public int queryBand(long sourceId, double ra, double dec, String band) {
+        long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+        String sql = String.format("SELECT ts FROM %s.hp_%d WHERE source_id=%d AND band='%s'",
+                database, hpid, sourceId, band);
+        int rowCount = 0;
+        try (Statement stmt = queryConnections[0].createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) rowCount++;
+        } catch (Exception e) {}
+        return rowCount;
+    }
+
+    // ==================== 批量并行查询接口 ====================
+
+    /** 批量并行简单查询（自包含），返回 int[]（每个查询的行数） */
+    public List<int[]> executeBatchSimpleQueries(List<long[]> sourceIdsWithCoords) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (long[] q : sourceIdsWithCoords) {
             queryPool.submit(() -> {
                 try {
-                    Connection c = queryConnections[(int)(hpid % QUERY_THREADS)];
-                    String sql = String.format(Locale.US, "SELECT source_id,FIRST(ra) as sra,FIRST(dec_val) as sdec,COUNT(*) as cnt FROM %s.hp_%d WHERE ts>=%d AND ts<=%d AND mag>=%f AND mag<=%f GROUP BY source_id HAVING COUNT(*)>=%d", database, hpid, startUs, endUs, magMin, magMax, minObs);
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    String sql = String.format("SELECT ts FROM %s.hp_%d WHERE source_id=%d ORDER BY ts", database, hpid, sourceId);
+                    int rowCount = 0;
+                    Connection c = queryConnections[(int)(Thread.currentThread().getId() % QUERY_THREADS)];
                     try (Statement stmt = c.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
-                        while (rs.next()) { if (isInCone(rs.getDouble("sra"),rs.getDouble("sdec"),ra,dec,radius)) matched.add(rs.getLong("source_id")); }
+                        while (rs.next()) rowCount++;
                     }
-                } catch (Exception e) {} finally { latch.countDown(); }
+                    results.add(new int[]{rowCount});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
             });
         }
         try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        return matched;
+        return results;
     }
 
-    private Set<Long> calcHealpixCone(double ra, double dec, double radius) {
-        Set<Long> ids = new HashSet<>();
-        try { new HealpixUtil().setNside(HEALPIX_LEVEL); RangeSet rs = HealpixUtil.queryDisc(ra, dec, radius, HEALPIX_LEVEL);
-            if (rs != null) for (int i = 0; i < rs.nranges(); i++) for (long p = rs.ivbegin(i); p <= rs.ivend(i); p++) ids.add(p);
-        } catch (Exception e) {} return ids;
+    /** 批量并行 STMK 查询（自包含），返回 int[]（每个查询匹配的sourceId数） */
+    public List<int[]> executeBatchSTMKQueries(List<double[]> paramsList) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(paramsList.size());
+        for (double[] p : paramsList) {
+            queryPool.submit(() -> {
+                try {
+                    double ra = p[0], dec = p[1], radius = p[2];
+                    double startTime = p[3], endTime = p[4];
+                    double magMin = p[5], magMax = p[6];
+                    int minObs = (int) p[7];
+                    String band = p.length > 9 ? bandFromCode((int) p[9]) : null;
+
+                    long startUs = (GAIA_EPOCH_UNIX_MS + (long)(startTime * MS_PER_DAY)) * 1000;
+                    long endUs = (GAIA_EPOCH_UNIX_MS + (long)(endTime * MS_PER_DAY)) * 1000;
+
+                    Set<Long> hpids = new HashSet<>();
+                    try {
+                        new HealpixUtil().setNside(HEALPIX_LEVEL);
+                        RangeSet rangeSet = HealpixUtil.queryDisc(ra, dec, radius, HEALPIX_LEVEL);
+                        if (rangeSet != null) for (int i = 0; i < rangeSet.nranges(); i++)
+                            for (long px = rangeSet.ivbegin(i); px <= rangeSet.ivend(i); px++) hpids.add(px);
+                    } catch (Exception e) {}
+
+                    int matched = 0;
+                    for (long hpid : hpids) {
+                        String bandFilter = (band != null && !band.isEmpty()) ? String.format(" AND band='%s'", band) : "";
+                        String sql = String.format(Locale.US,
+                                "SELECT source_id,FIRST(ra) as sra,FIRST(dec_val) as sdec,COUNT(*) as cnt FROM %s.hp_%d WHERE ts>=%d AND ts<=%d AND mag>=%f AND mag<=%f%s GROUP BY source_id HAVING COUNT(*)>=%d",
+                                database, hpid, startUs, endUs, magMin, magMax, bandFilter, minObs);
+                        Connection c = queryConnections[(int)(hpid % QUERY_THREADS)];
+                        try (Statement stmt = c.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+                            while (rs.next()) {
+                                if (isInCone(rs.getDouble("sra"), rs.getDouble("sdec"), ra, dec, radius)) matched++;
+                            }
+                        }
+                    }
+                    results.add(new int[]{matched});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(600, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行时间范围查询（自包含），返回 int[]（每个查询的行数） */
+    public List<int[]> executeBatchTimeRangeQueries(List<long[]> sourceIdsWithCoords, List<double[]> timeWindows) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (int idx = 0; idx < sourceIdsWithCoords.size(); idx++) {
+            final long[] q = sourceIdsWithCoords.get(idx);
+            final double[] tw = timeWindows.get(idx);
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    long startUs = (GAIA_EPOCH_UNIX_MS + (long)(tw[0] * MS_PER_DAY)) * 1000;
+                    long endUs = (GAIA_EPOCH_UNIX_MS + (long)(tw[1] * MS_PER_DAY)) * 1000;
+                    String sql = String.format("SELECT ts FROM %s.hp_%d WHERE source_id=%d AND ts>=%d AND ts<=%d",
+                            database, hpid, sourceId, startUs, endUs);
+                    int rowCount = 0;
+                    Connection c = queryConnections[(int)(Thread.currentThread().getId() % QUERY_THREADS)];
+                    try (Statement stmt = c.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+                        while (rs.next()) rowCount++;
+                    }
+                    results.add(new int[]{rowCount});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行聚合统计查询（自包含），返回 double[]（count, avgMag） */
+    public List<double[]> executeBatchAggregationQueries(List<long[]> sourceIdsWithCoords) {
+        List<double[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (long[] q : sourceIdsWithCoords) {
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    String sql = String.format(
+                            "SELECT COUNT(*),AVG(mag),MIN(mag),MAX(mag) FROM %s.hp_%d WHERE source_id=%d",
+                            database, hpid, sourceId);
+                    double count = 0, avgMag = 0;
+                    Connection c = queryConnections[(int)(Thread.currentThread().getId() % QUERY_THREADS)];
+                    try (Statement stmt = c.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+                        if (rs.next()) { count = rs.getDouble(1); avgMag = rs.getDouble(2); }
+                    }
+                    results.add(new double[]{count, avgMag});
+                } catch (Exception e) {
+                    results.add(new double[]{0, 0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行单波段查询（自包含），返回 int[]（每个查询的行数） */
+    public List<int[]> executeBatchBandQueries(List<long[]> sourceIdsWithCoords, List<String> bands) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (int idx = 0; idx < sourceIdsWithCoords.size(); idx++) {
+            final long[] q = sourceIdsWithCoords.get(idx);
+            final String band = bands.get(idx);
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    String sql = String.format("SELECT ts FROM %s.hp_%d WHERE source_id=%d AND band='%s'",
+                            database, hpid, sourceId, band);
+                    int rowCount = 0;
+                    Connection c = queryConnections[(int)(Thread.currentThread().getId() % QUERY_THREADS)];
+                    try (Statement stmt = c.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+                        while (rs.next()) rowCount++;
+                    }
+                    results.add(new int[]{rowCount});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    private static String bandFromCode(int code) {
+        switch (code) { case 1: return "G"; case 2: return "BP"; case 3: return "RP"; default: return null; }
+    }
+
+    private static int bandToCode(String band) {
+        if (band == null) return 0;
+        switch (band) { case "G": return 1; case "BP": return 2; case "RP": return 3; default: return 0; }
     }
     private static boolean isInCone(double ra1, double dec1, double ra2, double dec2, double radius) {
         double ra1R=Math.toRadians(ra1),dec1R=Math.toRadians(dec1),ra2R=Math.toRadians(ra2),dec2R=Math.toRadians(dec2);
@@ -189,6 +366,5 @@ public class TDengineClientWrapper implements AutoCloseable {
         try{queryPool.awaitTermination(30,TimeUnit.SECONDS);}catch(InterruptedException e){}
         for(Connection c:threadConnections){try{if(c!=null)c.close();}catch(Exception e){}}
         for(Connection c:queryConnections){try{if(c!=null)c.close();}catch(Exception e){}}
-        try(Connection c=createConn();Statement s=c.createStatement()){s.execute("DROP DATABASE IF EXISTS "+database);}catch(Exception e){}
     }
 }

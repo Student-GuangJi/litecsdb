@@ -1,5 +1,6 @@
 package org.example;
 
+import org.example.exp.FragmentedFlushManager;
 import org.example.utils.StorageUtils;
 import org.rocksdb.*;
 import org.rocksdb.util.SizeUnit;
@@ -9,6 +10,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.stream.Collectors;
 
 /**
  * 天文光变曲线 RocksDB 服务 - 针对 HEALPix 分区的分布式存储
@@ -44,6 +46,7 @@ public class RocksDBServer implements AutoCloseable {
     private final AtomicLong readCount = new AtomicLong(0);
     private final AtomicLong logicalBytesWritten = new AtomicLong(0);
     private final Statistics statistics;
+    private final FragmentedFlushManager flushManager;
     private final long startTime;
     private final long initialDirSize;
 
@@ -110,7 +113,8 @@ public class RocksDBServer implements AutoCloseable {
         this.writeOptions = new WriteOptions()
                 .setSync(false)
                 .setDisableWAL(false);
-
+        this.flushManager = new FragmentedFlushManager(
+                db, lightcurveHandle, config, writeOptions);
         storeMetadata(config);
         this.initialDirSize = StorageUtils.getDirectorySize(config.dbPath);
     }
@@ -130,26 +134,25 @@ public class RocksDBServer implements AutoCloseable {
 
         long batchLogicalSize = points.size() * 90L;
 
-        try (WriteBatch batch = new WriteBatch()) {
-            for (LightCurvePoint point : points) {
-                byte[] key = buildBinaryKey(point.sourceId, point.band, point.time);
-                byte[] value = serializeLightCurvePoint(point);
-                batch.put(lightcurveHandle, key, value);
-            }
-            db.write(writeOptions, batch);
-        }
+        // ======== 关键变更：委托给 FlushManager ========
+        // FlushManager 内部根据 config.maxFlushFragments 决定：
+        //   == 1  → 直接 WriteBatch（与原逻辑完全一致）
+        //   >  1  → 缓冲 + 碎片化 SST 写出 + Ingest
+        flushManager.write(points, lightcurveHandle);
 
         logicalBytesWritten.addAndGet(batchLogicalSize);
         writeCount.addAndGet(points.size());
 
-        // 元数据延迟聚合（内存操作，不读 RocksDB）
+        // 元数据延迟聚合（不变）
         for (LightCurvePoint point : points) {
             metadataCache.merge(point.sourceId,
-                    new StarMetadata(point.sourceId, point.ra, point.dec, 1, point.mag, point.time, point.time),
+                    new StarMetadata(point.sourceId, point.ra, point.dec,
+                            1, point.mag, point.time, point.time),
                     (existing, newMeta) -> new StarMetadata(
                             existing.sourceId, existing.ra, existing.dec,
                             existing.observationCount + 1,
-                            (existing.avgMag * existing.observationCount + newMeta.avgMag) / (existing.observationCount + 1),
+                            (existing.avgMag * existing.observationCount + newMeta.avgMag)
+                                    / (existing.observationCount + 1),
                             Math.min(existing.firstObsTime, newMeta.firstObsTime),
                             Math.max(existing.lastObsTime, newMeta.lastObsTime)
                     ));
@@ -890,7 +893,12 @@ public class RocksDBServer implements AutoCloseable {
         stats.put("last_flush_lower_level_boundary_hits", 0);
         stats.put("last_flush_static_boundary_hits", 0);
         stats.put("last_flush_dynamic_boundary_hits", 0);
-
+        // 碎片化 flush 统计
+        stats.putAll(flushManager.getStats()
+                .entrySet().stream()
+                .collect(Collectors.toMap(
+                        e -> "flush_mgr_" + e.getKey(),
+                        e -> (Object) e.getValue())));
         return stats;
     }
 
@@ -907,6 +915,7 @@ public class RocksDBServer implements AutoCloseable {
         if (lightcurveHandle != null) lightcurveHandle.close();
         if (metadataHandle != null) metadataHandle.close();
         if (timeBucketsHandle != null) timeBucketsHandle.close();
+        if (flushManager != null) flushManager.close();
         if (db != null) db.close();
         if (statistics != null) statistics.close();
     }
@@ -1068,6 +1077,27 @@ public class RocksDBServer implements AutoCloseable {
 
     // ========== 写放大统计 ==========
 
+    /**
+     * 获取 RocksDB Statistics 的指定 ticker 计数值
+     * 用于精确采集 compaction/flush 写入字节数
+     *
+     * 使用示例：
+     *   long compactWrite = server.getTickerCount(TickerType.COMPACT_WRITE_BYTES);
+     *   long flushWrite   = server.getTickerCount(TickerType.FLUSH_WRITE_BYTES);
+     */
+    public long getTickerCount(TickerType ticker) {
+        if (statistics == null) return 0;
+        return statistics.getTickerCount(ticker);
+    }
+
+     /**
+     * 获取碎片化 flush 管理器的统计信息
+     */
+     public Map<String, Long> getFlushManagerStats() {
+        if (flushManager == null) return Collections.emptyMap();
+        return flushManager.getStats();
+     }
+
     public Map<String, Double> getWriteAmplificationStats() {
         Map<String, Double> stats = new HashMap<>();
         try {
@@ -1095,7 +1125,7 @@ public class RocksDBServer implements AutoCloseable {
      * 3. 执行 compaction 使 SA 统计准确
      */
     public void forceFlush() throws RocksDBException {
-        // 1. 元数据内存缓存落盘
+        flushManager.forceFlush();
         if (!metadataCache.isEmpty()) {
             try (WriteBatch batch = new WriteBatch()) {
                 for (StarMetadata meta : metadataCache.values()) {
@@ -1123,7 +1153,7 @@ public class RocksDBServer implements AutoCloseable {
      * 只 flush，不 compact（用于 Phase 2 计时内）
      */
     public void forceFlushNoCompaction() throws RocksDBException {
-        // 元数据缓存落盘
+        flushManager.forceFlush();
         if (!metadataCache.isEmpty()) {
             try (WriteBatch batch = new WriteBatch()) {
                 for (StarMetadata meta : metadataCache.values()) {

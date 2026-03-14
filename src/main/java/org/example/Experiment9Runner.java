@@ -5,73 +5,70 @@ import org.example.RocksDBServer.LightCurvePoint;
 import org.example.wrapper.InfluxDBClientWrapper;
 import org.example.wrapper.NativeRocksDBWrapper;
 import org.example.wrapper.TDengineClientWrapper;
-import org.example.wrapper.TDengineClientWrapper;
 
 import java.io.*;
 import java.nio.file.*;
-import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 /**
- * Experiment 9: Query Performance Comparison (Simple + STMK)
+ * Experiment 9: Incremental Multi-Group Query Performance Comparison
  *
- * 纯查询测试，数据由 DataImporter 预先导入
- *
- * 实验设计：
- *   1. 简单查询：单天体光变曲线检索（点查询）
- *   2. STMK聚合查询：空间+时间+星等+观测次数联合约束
- *
- * 对比系统：
- *   - LitecsDB（调用 MainNode 接口）
- *   - TDengine（多线程并行 SQL 查询 + 应用层空间过滤）
- *   - InfluxDB（多线程并行 Flux 查询 + 应用层空间过滤）
- *   - Native RocksDB（多线程前缀扫描 + 应用层聚合过滤）
- *
- * 公平性保证：
- *   - 所有系统查询前清除缓存（重建连接 / RESET QUERY CACHE / 重新打开迭代器）
- *   - 所有系统通过真实数据库链接查询，不允许使用缓存
- *   - 每个查询之间清除缓存
- *   - 使用相同的查询参数
+ * 分组递增实验：8组不同数据规模（10→100K天体），增量写入，每组跑完整查询基准测试
+ * 5种查询类型 × 4个系统，观察查询性能随数据规模的变化趋势
  */
 public class Experiment9Runner {
 
+    // ==================== 分组配置 ====================
+    private static final int[] GROUP_SIZES = {10, 100, 500, 1_000, 5_000, 10_000, 50_000, 100_000};
+    private static final String DATA_DIR = "generated_datasets/batch_2000000/individual_lightcurves/";
+    private static final String DATA_BASE_DIR = "generated_datasets/";
+
     // ==================== 实验配置 ====================
-    private static final int SIMPLE_QUERY_COUNT = 5;
+    private static final int SIMPLE_QUERY_COUNT = 100;
     private static final int STMK_QUERY_COUNT = 5;
-    private static final int MAX_PRINT_ROWS = 3;   // 简单查询最多打印前N行详细数据
-    private static final int MAX_PRINT_IDS = 10;    // STMK查询最多打印前N个source_id
-    private static final int WARMUP_QUERIES = 3;        // 预热查询数（不计入结果）
+    private static final double QUERY_RADIUS = 0.5;
+    private static final int QUERY_MIN_K = 3;
+    private static final String[] BANDS = {"G", "BP", "RP"};
     private static final int HEALPIX_LEVEL = 1;
     private static final int NODE_COUNT = 2;
-
     private static final String RESULT_DIR = "experiment9_results/";
-
-    // TDengine
-    private static final String TDENGINE_USER = "root";
-    private static final String TDENGINE_PASSWORD = "taosdata";
-
-    // InfluxDB
+    private static final String LITECSDB_PATH = RESULT_DIR + "litecsdb_exp9/";
+    private static final String ROCKSDB_PATH = RESULT_DIR + "rocksdb_exp9/";
     private static final String INFLUX_BUCKET = "gaia_lightcurves";
+    private static final String TDENGINE_DB = "astro_exp9";
 
-    // GAIA 时间转换常量
-    private static final long GAIA_EPOCH_UNIX_MS = 1420070400000L;
-    private static final long MS_PER_DAY = 86400000L;
+    // ==================== 系统句柄（跨组复用） ====================
+    private MainNode mainNode;
+    private TDengineClientWrapper tdengine;
+    private InfluxDBClientWrapper influxDB;
+    private NativeRocksDBWrapper nativeRocksDB;
 
-    // ==================== 结果记录 ====================
-    private final List<QueryBenchmarkResult> simpleResults = new ArrayList<>();
-    private final List<QueryBenchmarkResult> stmkResults = new ArrayList<>();
-    private PrintWriter logWriter;
-    private PrintWriter csvWriter;
+    // ==================== 轻量级数据追踪 ====================
+    private final Set<Long> loadedSourceIds = new LinkedHashSet<>();
+    private final Map<Long, double[]> sourceCoordCache = new HashMap<>();
+    private double globalMinTime = Double.MAX_VALUE, globalMaxTime = Double.MIN_VALUE;
+    private double globalMinMag = Double.MAX_VALUE, globalMaxMag = Double.MIN_VALUE;
+    private boolean phase1Done = false;
 
-    // 查询参数（从TDengine获取，所有系统共用）
+    // ==================== 查询参数 ====================
     private List<Long> simpleQuerySourceIds;
     private List<STMKQueryParams> stmkParams;
+    private List<double[]> timeRangeWindows;
+    private List<String> bandQueryBands;
 
+    // ==================== 结果记录（按组） ====================
+    // groupIdx -> list of QueryBenchmarkResult (4 systems per group)
+    private final Map<Integer, List<QueryBenchmarkResult>> simpleResultsByGroup = new LinkedHashMap<>();
+    private final Map<Integer, List<QueryBenchmarkResult>> stmkResultsByGroup = new LinkedHashMap<>();
+    private final Map<Integer, List<QueryBenchmarkResult>> timeRangeResultsByGroup = new LinkedHashMap<>();
+    private final Map<Integer, List<QueryBenchmarkResult>> aggResultsByGroup = new LinkedHashMap<>();
+    private final Map<Integer, List<QueryBenchmarkResult>> bandResultsByGroup = new LinkedHashMap<>();
+    private PrintWriter logWriter;
+
+    // ==================== Main ====================
     public static void main(String[] args) {
         new Experiment9Runner().run();
     }
@@ -81,672 +78,774 @@ public class Experiment9Runner {
         initWriters();
 
         log("================================================================================");
-        log("Experiment 9: Query Performance Comparison (Simple + STMK)");
+        log("Experiment 9: Incremental Multi-Group Query Performance Comparison");
         log("Start time: " + LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
+        log("Groups: " + Arrays.toString(GROUP_SIZES));
         log("================================================================================");
-        log("");
-        log("配置: simpleQueries=" + SIMPLE_QUERY_COUNT +
-                ", stmkQueries=" + STMK_QUERY_COUNT +
-                ", warmup=" + WARMUP_QUERIES);
-        log("注意: 数据需预先通过 DataImporter 导入各系统");
-        log("注意: 每次查询前清除缓存，确保公平对比");
-        log("");
 
         try {
-            // 从TDengine获取查询参数（source_id列表、数据范围等）
-            initQueryParams();
+            // Step 1: 加载坐标映射
+            Map<Long, String> coordMap = loadCoordinateMap();
+            log("[Init] 加载了 " + coordMap.size() + " 个天体坐标");
 
-            // 测试各系统（顺序随机化以减少系统级别的缓存偏差）
-            testLitecsDB();
-            testTDengine();
-            testInfluxDB();
-            testNativeRocksDB();
+            // Step 2: 列出并排序所有CSV文件
+            File[] allFiles = listAndSortCsvFiles();
+            log("[Init] 找到 " + allFiles.length + " 个CSV文件（天体）");
+            if (allFiles.length < GROUP_SIZES[GROUP_SIZES.length - 1]) {
+                log("[WARN] 文件数 " + allFiles.length + " 不足最大组 " + GROUP_SIZES[GROUP_SIZES.length - 1]);
+            }
+
+            // Step 3: 初始化所有数据库系统
+            initAllSystems();
+
+            // Step 4: 主循环 — 逐组递增
+            int filesLoadedSoFar = 0;
+
+            for (int g = 0; g < GROUP_SIZES.length; g++) {
+                int targetCount = Math.min(GROUP_SIZES[g], allFiles.length);
+                int delta = targetCount - filesLoadedSoFar;
+                if (delta <= 0) {
+                    log("[SKIP] Group " + (g + 1) + ": 无新文件可加载");
+                    continue;
+                }
+
+                log("\n" + "#".repeat(80));
+                log(String.format("GROUP %d/%d: 加载天体 %d -> %d (增量: %d 个天体)",
+                        g + 1, GROUP_SIZES.length, filesLoadedSoFar + 1, targetCount, delta));
+                log("#".repeat(80));
+
+                // 4a: 解析增量CSV文件
+                ParseResult parseResult = parseDeltaFiles(allFiles, filesLoadedSoFar, targetCount, coordMap);
+                log(String.format("  解析了 %d 个点，来自 %d 个新文件", parseResult.points.size(), delta));
+
+                // 4b: 写入所有系统
+                long insertStart = System.currentTimeMillis();
+                insertIntoAllSystems(parseResult.points, parseResult.csvLines);
+                log(String.format("  写入完成，耗时 %d ms", System.currentTimeMillis() - insertStart));
+
+                // 4c: 更新统计
+                updateStats(parseResult.points);
+                filesLoadedSoFar = targetCount;
+
+                // 4d: Flush + 构建索引
+                flushAndBuildIndexes();
+
+                // 4e: 生成查询参数
+                deriveQueryParams();
+
+                // 4f: 运行查询基准测试
+                runGroupBenchmark(g, targetCount);
+            }
+
+            // Step 5: 汇总报告
+            printGroupedSummaryReport();
+            exportGroupedCSV();
 
         } catch (Exception e) {
             log("[ERROR] Experiment failed: " + e.getMessage());
             e.printStackTrace();
-        }
-
-        printSummaryReport();
-        exportCSV();
-        closeWriters();
-    }
-
-    /**
-     * 从TDengine获取查询参数
-     */
-    private void initQueryParams() throws SQLException {
-        log("[Init] Fetching query parameters from TDengine...");
-
-        Connection conn = null;
-        try {
-            conn = DriverManager.getConnection(
-                    "jdbc:TAOS://127.0.0.1:6030/?charset=UTF-8",
-                    TDENGINE_USER, TDENGINE_PASSWORD);
-
-            String dbName = findTDengineDatabase(conn);
-            if (dbName == null) {
-                throw new RuntimeException("No TDengine database found. Run DataImporter first.");
-            }
-            log("  Using database: " + dbName);
-
-            // 获取source_id列表
-            simpleQuerySourceIds = new ArrayList<>();
-            String sql = "SELECT DISTINCT source_id FROM " + dbName + ".lightcurve LIMIT " +
-                    (SIMPLE_QUERY_COUNT + WARMUP_QUERIES);
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-                while (rs.next()) {
-                    simpleQuerySourceIds.add(rs.getLong(1));
-                }
-            }
-            log("  Got " + simpleQuerySourceIds.size() + " source IDs for simple queries");
-
-            // 获取数据范围用于STMK查询
-            double minTime = 0, maxTime = 3000;
-            double minMag = 5, maxMag = 20;
-            sql = "SELECT MIN(obs_time), MAX(obs_time), MIN(mag), MAX(mag) FROM " + dbName + ".lightcurve";
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-                if (rs.next()) {
-                    minTime = rs.getDouble(1);
-                    maxTime = rs.getDouble(2);
-                    minMag = rs.getDouble(3);
-                    maxMag = rs.getDouble(4);
-                }
-            }
-            log(String.format("  Data range: time=[%.2f, %.2f], mag=[%.2f, %.2f]",
-                    minTime, maxTime, minMag, maxMag));
-
-            // 获取样本坐标用于STMK空间查询
-            List<double[]> sampleCoords = new ArrayList<>();
-            sql = "SELECT DISTINCT source_id, ra, dec_val FROM " + dbName + ".lightcurve LIMIT 20";
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-                while (rs.next()) {
-                    sampleCoords.add(new double[]{rs.getDouble(2), rs.getDouble(3)});
-                }
-            }
-
-            // 生成STMK查询参数
-            stmkParams = new ArrayList<>();
-            Random rand = new Random(42);
-            double[] radii = {5.0, 10.0, 20.0};
-            int[] minObsList = {3, 5, 10};
-            String[] bands = {"G", "BP", "RP"};
-
-            for (int i = 0; i < STMK_QUERY_COUNT + WARMUP_QUERIES; i++) {
-                double[] coord = sampleCoords.get(rand.nextInt(sampleCoords.size()));
-                double timeRange = maxTime - minTime;
-                double startTime = minTime + rand.nextDouble() * 0.3 * timeRange;
-                double endTime = startTime + (0.3 + rand.nextDouble() * 0.4) * timeRange;
-
-                stmkParams.add(new STMKQueryParams(
-                        coord[0], coord[1], radii[rand.nextInt(radii.length)],
-                        startTime, endTime, bands[rand.nextInt(bands.length)],
-                        minMag, maxMag, minObsList[rand.nextInt(minObsList.length)]
-                ));
-            }
-            log("  Generated " + stmkParams.size() + " STMK query parameters (incl. " + WARMUP_QUERIES + " warmup)");
-
         } finally {
-            if (conn != null) conn.close();
+            shutdownAllSystems();
+            closeWriters();
         }
-    }
-
-    private String findTDengineDatabase(Connection conn) throws SQLException {
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SHOW DATABASES")) {
-            while (rs.next()) {
-                String name = rs.getString(1);
-                if (name.startsWith("astro_exp9_")) {
-                    return name;
-                }
-            }
-        }
-        return null;
-    }
-
-    // ==================== LitecsDB 测试 ====================
-    private void testLitecsDB() {
-        log("\n" + "=".repeat(60));
-        log("Testing LitecsDB");
-        log("=".repeat(60));
-
-        File resultDir = new File(RESULT_DIR);
-        File[] litecsdbDirs = resultDir.listFiles((dir, name) -> name.startsWith("litecsdb_"));
-        if (litecsdbDirs == null || litecsdbDirs.length == 0) {
-            log("[ERROR] No LitecsDB database found in " + RESULT_DIR);
-            return;
-        }
-        String basePath = litecsdbDirs[0].getAbsolutePath() + "/";
-        log("  Using database: " + basePath);
-
-        MainNode mainNode = null;
-        try {
-            mainNode = new MainNode(NODE_COUNT, HEALPIX_LEVEL, basePath);
-
-            // 预建索引缓存 — 构建 star metadata 映射用于简单查询
-            log("  Building metadata index for simple queries...");
-            Map<Long, long[]> sourceToHealpix = new HashMap<>(); // sourceId -> [healpixId]
-            List<org.example.RocksDBServer.StarMetadata> allStars = mainNode.getAllStarsMetadata();
-            for (org.example.RocksDBServer.StarMetadata star : allStars) {
-                long hpid = mainNode.calculateHealpixId(star.ra, star.dec);
-                sourceToHealpix.put(star.sourceId, new long[]{hpid});
-            }
-            log("  Indexed " + sourceToHealpix.size() + " stars");
-
-            // === 简单查询测试 ===
-            log("  Running simple queries (" + SIMPLE_QUERY_COUNT + " queries, " + WARMUP_QUERIES + " warmup)...");
-            List<Double> simpleLats = new ArrayList<>();
-            int totalPoints = 0;
-
-            for (int i = 0; i < simpleQuerySourceIds.size(); i++) {
-                long sid = simpleQuerySourceIds.get(i);
-                long[] hpInfo = sourceToHealpix.get(sid);
-
-                long start = System.nanoTime();
-                List<LightCurvePoint> lc = new ArrayList<>();
-                if (hpInfo != null) {
-                    // 查询全部波段（G/BP/RP）的所有属性
-                    for (String band : new String[]{"G", "BP", "RP"}) {
-                        lc.addAll(mainNode.getLightCurve(hpInfo[0], sid, band));
-                    }
-                }
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    simpleLats.add(latency);
-                    totalPoints += lc.size();
-                    logSimpleQueryDetail("LitecsDB", i - WARMUP_QUERIES, sid, lc, latency);
-                }
-            }
-            logSimpleResults("LitecsDB", simpleLats,
-                    simpleLats.isEmpty() ? 0 : totalPoints / simpleLats.size());
-
-            // === STMK查询测试 ===
-            log("  Running STMK queries (" + STMK_QUERY_COUNT + " queries, " + WARMUP_QUERIES + " warmup)...");
-            List<Double> stmkLats = new ArrayList<>();
-            List<Integer> stmkCounts = new ArrayList<>();
-
-            for (int i = 0; i < stmkParams.size(); i++) {
-                STMKQueryParams q = stmkParams.get(i);
-
-                long start = System.nanoTime();
-                DistributedQueryResult result = mainNode.executeSTMKQuery(
-                        q.ra, q.dec, q.radius, q.startTime, q.endTime,
-                        q.band, q.magMin, q.magMax, q.minObs);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    stmkLats.add(latency);
-                    stmkCounts.add(result.candidateCount);
-                    List<Long> matchedIds = new ArrayList<>(result.candidateObjects);
-                    logSTMKQueryDetail("LitecsDB", i - WARMUP_QUERIES, q, matchedIds, latency);
-                }
-            }
-            logSTMKResults("LitecsDB", stmkLats, stmkCounts);
-
-        } catch (Exception e) {
-            log("[ERROR] LitecsDB test failed: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            if (mainNode != null) mainNode.shutdown();
-        }
-    }
-
-    // ==================== TDengine 测试 ====================
-    private void testTDengine() {
-        log("\n" + "=".repeat(60));
-        log("Testing TDengine (HEALPix supertable + TAG-based query)");
-        log("=".repeat(60));
-
-        TDengineClientWrapper tdengine = null;
-        try {
-            tdengine = new TDengineClientWrapper(findTDengineDbName());
-            tdengine.clearQueryCache();
-
-            // === 简单查询测试 ===
-            log("  Running simple queries...");
-            List<Double> simpleLats = new ArrayList<>();
-            int totalPoints = 0;
-
-            for (int i = 0; i < simpleQuerySourceIds.size(); i++) {
-                long sid = simpleQuerySourceIds.get(i);
-                long start = System.nanoTime();
-                List<LightCurvePoint> rows = tdengine.executeSimpleQuery(sid);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    simpleLats.add(latency);
-                    totalPoints += rows.size();
-                    logSimpleQueryDetail("TDengine", i - WARMUP_QUERIES, sid, rows, latency);
-                }
-            }
-            logSimpleResults("TDengine", simpleLats,
-                    simpleLats.isEmpty() ? 0 : totalPoints / simpleLats.size());
-
-            // === STMK 查询测试 ===
-            log("  Running STMK queries (HEALPix-pruned)...");
-            tdengine.clearQueryCache();
-            List<Double> stmkLats = new ArrayList<>();
-            List<Integer> stmkCounts = new ArrayList<>();
-
-            for (int i = 0; i < stmkParams.size(); i++) {
-                STMKQueryParams q = stmkParams.get(i);
-                tdengine.clearQueryCache();
-
-                long start = System.nanoTime();
-                List<Long> matchedIds = tdengine.executeSTMKQuery(
-                        q.ra, q.dec, q.radius, q.startTime, q.endTime,
-                        q.magMin, q.magMax, q.minObs);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    stmkLats.add(latency);
-                    stmkCounts.add(matchedIds.size());
-                    logSTMKQueryDetail("TDengine", i - WARMUP_QUERIES, q, matchedIds, latency);
-                }
-            }
-            logSTMKResults("TDengine", stmkLats, stmkCounts);
-
-        } catch (Exception e) {
-            log("[ERROR] TDengine test failed: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            if (tdengine != null) tdengine.close();
-        }
-    }
-
-    /** 查找已存在的 TDengine 数据库名 */
-    private String findTDengineDbName() {
-        try {
-            Connection conn = DriverManager.getConnection(
-                    "jdbc:TAOS://127.0.0.1:6030/?charset=UTF-8", TDENGINE_USER, TDENGINE_PASSWORD);
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery("SHOW DATABASES")) {
-                while (rs.next()) {
-                    String name = rs.getString(1);
-                    if (name.startsWith("astro_exp9")) { conn.close(); return name; }
-                }
-            }
-            conn.close();
-        } catch (Exception e) { /* ignore */ }
-        return "astro_exp9";
-    }
-
-    // ==================== InfluxDB 测试 ====================
-    private void testInfluxDB() {
-        log("\n" + "=".repeat(60));
-        log("Testing InfluxDB (HEALPix measurement + tag-based query)");
-        log("=".repeat(60));
-
-        InfluxDBClientWrapper influx = null;
-        try {
-            influx = new InfluxDBClientWrapper(INFLUX_BUCKET);
-
-            // === 简单查询测试 ===
-            log("  Running simple queries...");
-            List<Double> simpleLats = new ArrayList<>();
-            int totalPoints = 0;
-
-            for (int i = 0; i < simpleQuerySourceIds.size(); i++) {
-                long sid = simpleQuerySourceIds.get(i);
-                long start = System.nanoTime();
-                List<String> rows = influx.executeSimpleQuery(sid);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    simpleLats.add(latency);
-                    totalPoints += rows.size();
-                    log(String.format("    [Simple-%d] REQUEST:  sourceId=%d", i - WARMUP_QUERIES, sid));
-                    log(String.format("    [Simple-%d] RESPONSE: %d rows, latency=%.3fms",
-                            i - WARMUP_QUERIES, rows.size(), latency));
-                    int printCount = Math.min(rows.size(), MAX_PRINT_ROWS);
-                    for (int r = 0; r < printCount; r++) {
-                        log("      Row " + (r + 1) + ": " + rows.get(r));
-                    }
-                    if (rows.size() > MAX_PRINT_ROWS) {
-                        log("      ... (" + (rows.size() - MAX_PRINT_ROWS) + " more rows omitted)");
-                    }
-                }
-            }
-            logSimpleResults("InfluxDB", simpleLats,
-                    simpleLats.isEmpty() ? 0 : totalPoints / simpleLats.size());
-
-            // === STMK 查询测试 ===
-            log("  Running STMK queries (HEALPix-pruned)...");
-            List<Double> stmkLats = new ArrayList<>();
-            List<Integer> stmkCounts = new ArrayList<>();
-
-            for (int i = 0; i < stmkParams.size(); i++) {
-                STMKQueryParams q = stmkParams.get(i);
-
-                long start = System.nanoTime();
-                List<Long> matchedIds = influx.executeSTMKQuery(
-                        q.ra, q.dec, q.radius, q.startTime, q.endTime,
-                        q.magMin, q.magMax, q.minObs);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    stmkLats.add(latency);
-                    stmkCounts.add(matchedIds.size());
-                    logSTMKQueryDetail("InfluxDB", i - WARMUP_QUERIES, q, matchedIds, latency);
-                }
-            }
-            logSTMKResults("InfluxDB", stmkLats, stmkCounts);
-
-        } catch (Exception e) {
-            log("[ERROR] InfluxDB test failed: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            if (influx != null) influx.close();
-        }
-    }
-
-    // ==================== Native RocksDB 测试（多线程优化） ====================
-    private void testNativeRocksDB() {
-        log("\n" + "=".repeat(60));
-        log("Testing Native RocksDB (multi-threaded)");
-        log("=".repeat(60));
-
-        File resultDir = new File(RESULT_DIR);
-        File[] rocksdbDirs = resultDir.listFiles((dir, name) -> name.startsWith("rocksdb_"));
-        if (rocksdbDirs == null || rocksdbDirs.length == 0) {
-            log("[ERROR] No NativeRocksDB database found in " + RESULT_DIR);
-            return;
-        }
-        String dbPath = rocksdbDirs[0].getAbsolutePath();
-        log("  Using database: " + dbPath);
-
-        NativeRocksDBWrapper rocksdb = null;
-        try {
-            rocksdb = new NativeRocksDBWrapper(dbPath);
-
-            // === 简单查询测试 ===
-            // NativeRocksDB 通过前缀扫描返回全部数据，queryBySourceId 内部读取所有列
-            log("  Running simple queries...");
-            List<Double> simpleLats = new ArrayList<>();
-            int totalPoints = 0;
-
-            for (int i = 0; i < simpleQuerySourceIds.size(); i++) {
-                long sid = simpleQuerySourceIds.get(i);
-                long start = System.nanoTime();
-                int count = rocksdb.queryBySourceId(sid);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    simpleLats.add(latency);
-                    totalPoints += count;
-                    log(String.format("    [Simple-%d] REQUEST:  sourceId=%d", i - WARMUP_QUERIES, sid));
-                    log(String.format("    [Simple-%d] RESPONSE: %d rows (all columns scanned via prefix seek), latency=%.3fms",
-                            i - WARMUP_QUERIES, count, latency));
-                }
-            }
-            logSimpleResults("NativeRocksDB", simpleLats,
-                    simpleLats.isEmpty() ? 0 : totalPoints / simpleLats.size());
-
-            // === STMK查询测试（已内置多线程扫描） ===
-            log("  Running STMK queries...");
-            List<Double> stmkLats = new ArrayList<>();
-            List<Integer> stmkCounts = new ArrayList<>();
-
-            for (int i = 0; i < stmkParams.size(); i++) {
-                STMKQueryParams q = stmkParams.get(i);
-                long start = System.nanoTime();
-                int count = rocksdb.executeSTMKQuery(q.startTime, q.endTime, q.band,
-                        q.magMin, q.magMax, q.ra, q.dec, q.radius, q.minObs);
-                double latency = (System.nanoTime() - start) / 1_000_000.0;
-
-                if (i >= WARMUP_QUERIES) {
-                    stmkLats.add(latency);
-                    stmkCounts.add(count);
-                    log(String.format(Locale.US,
-                            "    [STMK-%d] REQUEST:  ra=%.4f, dec=%.4f, radius=%.2f sq.deg, " +
-                                    "t_min=%.2f, t_max=%.2f, mag_min=%.4f, mag_max=%.4f, count=%d",
-                            i - WARMUP_QUERIES, q.ra, q.dec, q.radius,
-                            q.startTime, q.endTime, q.magMin, q.magMax, q.minObs));
-                    log(String.format("    [STMK-%d] RESPONSE: %d source_ids matched (full scan + app-level filter), latency=%.2fms",
-                            i - WARMUP_QUERIES, count, latency));
-                }
-            }
-            logSTMKResults("NativeRocksDB", stmkLats, stmkCounts);
-
-        } catch (Exception e) {
-            log("[ERROR] Native RocksDB test failed: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            if (rocksdb != null) rocksdb.close();
-        }
-    }
-
-    // ==================== 格式化输出辅助 ====================
-
-    /** 格式化打印单条 LightCurvePoint 的所有属性 */
-    private String formatPoint(LightCurvePoint p) {
-        return String.format(Locale.US,
-                "sourceId=%d, ra=%.6f, dec=%.6f, transitId=%d, band=%s, time=%.4f, " +
-                        "mag=%.4f, flux=%.6f, fluxErr=%.6f, fluxOverErr=%.4f, " +
-                        "rejPhoto=%s, rejVar=%s, flags=%d, solId=%d",
-                p.sourceId, p.ra, p.dec, p.transitId, p.band, p.time,
-                p.mag, p.flux, p.fluxError, p.fluxOverError,
-                p.rejectedByPhotometry, p.rejectedByVariability, p.otherFlags, p.solutionId);
-    }
-
-    /** 格式化打印简单查询的请求与响应 */
-    private void logSimpleQueryDetail(String system, int queryIdx, long sourceId,
-                                      List<LightCurvePoint> rows, double latencyMs) {
-        log(String.format("    [Simple-%d] REQUEST:  sourceId=%d", queryIdx, sourceId));
-        log(String.format("    [Simple-%d] RESPONSE: %d rows, latency=%.3fms", queryIdx, rows.size(), latencyMs));
-        int printCount = Math.min(rows.size(), MAX_PRINT_ROWS);
-        for (int r = 0; r < printCount; r++) {
-            log("      Row " + (r + 1) + ": " + formatPoint(rows.get(r)));
-        }
-        if (rows.size() > MAX_PRINT_ROWS) {
-            log("      ... (" + (rows.size() - MAX_PRINT_ROWS) + " more rows omitted)");
-        }
-    }
-
-    /** 格式化打印STMK查询的请求与响应 */
-    private void logSTMKQueryDetail(String system, int queryIdx, STMKQueryParams q,
-                                    List<Long> matchedIds, double latencyMs) {
-        log(String.format(Locale.US,
-                "    [STMK-%d] REQUEST:  ra=%.4f, dec=%.4f, radius=%.2f sq.deg, " +
-                        "t_min=%.2f, t_max=%.2f, mag_min=%.4f, mag_max=%.4f, count=%d",
-                queryIdx, q.ra, q.dec, q.radius,
-                q.startTime, q.endTime, q.magMin, q.magMax, q.minObs));
-        log(String.format("    [STMK-%d] RESPONSE: %d source_ids matched, latency=%.2fms",
-                queryIdx, matchedIds.size(), latencyMs));
-        if (!matchedIds.isEmpty()) {
-            int printCount = Math.min(matchedIds.size(), MAX_PRINT_IDS);
-            StringBuilder sb = new StringBuilder("      Matched source_ids: [");
-            for (int r = 0; r < printCount; r++) {
-                if (r > 0) sb.append(", ");
-                sb.append(matchedIds.get(r));
-            }
-            if (matchedIds.size() > MAX_PRINT_IDS) {
-                sb.append(", ... +(").append(matchedIds.size() - MAX_PRINT_IDS).append(" more)");
-            }
-            sb.append("]");
-            log(sb.toString());
-        }
-    }
-
-    // ==================== 空间工具 ====================
-
-    private static boolean isInCone(double ra1, double dec1, double ra2, double dec2, double radius) {
-        double ra1R = Math.toRadians(ra1), dec1R = Math.toRadians(dec1);
-        double ra2R = Math.toRadians(ra2), dec2R = Math.toRadians(dec2);
-        double a = Math.sin((dec2R - dec1R) / 2) * Math.sin((dec2R - dec1R) / 2) +
-                Math.cos(dec1R) * Math.cos(dec2R) *
-                        Math.sin((ra2R - ra1R) / 2) * Math.sin((ra2R - ra1R) / 2);
-        return Math.toDegrees(2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))) <= radius;
-    }
-
-    // ==================== 日志和结果 ====================
-
-    private void logSimpleResults(String system, List<Double> latencies, int avgPoints) {
-        double avg = latencies.stream().mapToDouble(d -> d).average().orElse(0);
-        double p50 = percentile(latencies, 50);
-        double p99 = percentile(latencies, 99);
-        double min = latencies.stream().mapToDouble(d -> d).min().orElse(0);
-        double max = latencies.stream().mapToDouble(d -> d).max().orElse(0);
-        double qps = avg > 0 ? 1000.0 / avg : 0;
-
-        log(String.format("  [Simple Query] %s: avg=%.3fms, p50=%.3fms, p99=%.3fms, " +
-                        "min=%.3fms, max=%.3fms, QPS=%.1f, avgPoints=%d",
-                system, avg, p50, p99, min, max, qps, avgPoints));
-
-        simpleResults.add(new QueryBenchmarkResult(system + "_simple", latencies, null));
-    }
-
-    private void logSTMKResults(String system, List<Double> latencies, List<Integer> counts) {
-        double avg = latencies.stream().mapToDouble(d -> d).average().orElse(0);
-        double p50 = percentile(latencies, 50);
-        double p99 = percentile(latencies, 99);
-        double min = latencies.stream().mapToDouble(d -> d).min().orElse(0);
-        double max = latencies.stream().mapToDouble(d -> d).max().orElse(0);
-        double qps = avg > 0 ? 1000.0 / avg : 0;
-        double avgResults = counts.stream().mapToInt(i -> i).average().orElse(0);
-
-        log(String.format("  [STMK Query]   %s: avg=%.3fms, p50=%.3fms, p99=%.3fms, " +
-                        "min=%.3fms, max=%.3fms, QPS=%.1f, avgResults=%.1f",
-                system, avg, p50, p99, min, max, qps, avgResults));
-
-        stmkResults.add(new QueryBenchmarkResult(system, latencies, counts));
-    }
-
-    private double percentile(List<Double> data, int p) {
-        if (data.isEmpty()) return 0;
-        List<Double> sorted = data.stream().sorted().collect(Collectors.toList());
-        int idx = (int) Math.ceil(p / 100.0 * sorted.size()) - 1;
-        return sorted.get(Math.max(0, Math.min(idx, sorted.size() - 1)));
-    }
-
-    private void printSummaryReport() {
-        log("\n" + "=".repeat(80));
-        log("SUMMARY: Query Performance Comparison");
-        log("=".repeat(80));
-
-        // Simple Query Summary
-        log("\n--- Simple Query Results ---");
-        log(String.format("%-15s %12s %12s %12s %12s %10s",
-                "System", "Avg(ms)", "P50(ms)", "P99(ms)", "Min(ms)", "QPS"));
-        log("-".repeat(75));
-
-        for (QueryBenchmarkResult r : simpleResults) {
-            log(String.format("%-15s %12.2f %12.2f %12.2f %12.2f %10.1f",
-                    r.system.replace("_simple", ""),
-                    r.avgLatency, r.p50Latency, r.p99Latency, r.minLatency, r.throughput));
-        }
-
-        // STMK Query Summary
-        log("\n--- STMK Query Results ---");
-        log(String.format("%-15s %12s %12s %12s %12s %10s %10s",
-                "System", "Avg(ms)", "P50(ms)", "P99(ms)", "Min(ms)", "QPS", "AvgRes"));
-        log("-".repeat(85));
-
-        QueryBenchmarkResult litecsResult = stmkResults.stream()
-                .filter(r -> r.system.equals("LitecsDB")).findFirst().orElse(null);
-
-        for (QueryBenchmarkResult r : stmkResults) {
-            String speedup = "";
-            if (litecsResult != null && !r.system.equals("LitecsDB") && litecsResult.avgLatency > 0) {
-                double ratio = r.avgLatency / litecsResult.avgLatency;
-                speedup = String.format(" (%.1fx %s)", ratio > 1 ? ratio : 1.0 / ratio,
-                        ratio > 1 ? "slower" : "faster");
-            }
-            log(String.format("%-15s %12.2f %12.2f %12.2f %12.2f %10.1f %10.1f%s",
-                    r.system, r.avgLatency, r.p50Latency, r.p99Latency,
-                    r.minLatency, r.throughput, r.avgResults, speedup));
-        }
-
-        log("\nExperiment completed at: " + LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-    }
-
-    private void exportCSV() {
-        try {
-            String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-            PrintWriter csv = new PrintWriter(new FileWriter(RESULT_DIR + "experiment9_" + ts + ".csv"));
-            csv.println("query_type,system,query_idx,latency_ms,result_count");
-
-            for (QueryBenchmarkResult r : simpleResults) {
-                for (int i = 0; i < r.latencies.size(); i++) {
-                    csv.printf("%s,%s,%d,%.3f,%d%n", "simple",
-                            r.system.replace("_simple", ""), i, r.latencies.get(i), 0);
-                }
-            }
-
-            for (QueryBenchmarkResult r : stmkResults) {
-                for (int i = 0; i < r.latencies.size(); i++) {
-                    int cnt = (r.counts != null && i < r.counts.size()) ? r.counts.get(i) : 0;
-                    csv.printf("%s,%s,%d,%.3f,%d%n", "stmk", r.system, i, r.latencies.get(i), cnt);
-                }
-            }
-
-            csv.close();
-            log("CSV exported to " + RESULT_DIR);
-        } catch (IOException e) {
-            log("[WARN] CSV export failed: " + e.getMessage());
-        }
-    }
-
-    private void initResultDir() {
-        try { Files.createDirectories(Paths.get(RESULT_DIR)); } catch (IOException e) {}
-    }
-
-    private void initWriters() {
-        try {
-            String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-            logWriter = new PrintWriter(new FileWriter(RESULT_DIR + "experiment9_" + ts + ".log"));
-        } catch (IOException e) {}
-    }
-
-    private void closeWriters() {
-        if (logWriter != null) logWriter.close();
-    }
-
-    private void log(String msg) {
-        System.out.println(msg);
-        if (logWriter != null) { logWriter.println(msg); logWriter.flush(); }
     }
 
     // ==================== 内部类 ====================
 
-    static class STMKQueryParams {
-        final double ra, dec, radius, startTime, endTime;
-        final String band;
-        final double magMin, magMax;
-        final int minObs;
+    private static class ParseResult {
+        List<LightCurvePoint> points = new ArrayList<>();
+        List<String> csvLines = new ArrayList<>();
+    }
 
-        STMKQueryParams(double ra, double dec, double radius, double startTime, double endTime,
+    private static class STMKQueryParams {
+        double ra, dec, radius, startTime, endTime, magMin, magMax;
+        String band;
+        int minObs;
+
+        STMKQueryParams(double ra, double dec, double radius, double st, double et,
                         String band, double magMin, double magMax, int minObs) {
-            this.ra = ra; this.dec = dec; this.radius = radius;
-            this.startTime = startTime; this.endTime = endTime;
-            this.band = band; this.magMin = magMin; this.magMax = magMax;
+            this.ra = ra;
+            this.dec = dec;
+            this.radius = radius;
+            this.startTime = st;
+            this.endTime = et;
+            this.band = band;
+            this.magMin = magMin;
+            this.magMax = magMax;
             this.minObs = minObs;
         }
     }
 
-    static class QueryBenchmarkResult {
-        final String system;
-        final double avgLatency, p50Latency, p99Latency, minLatency, maxLatency, throughput;
-        final double avgResults;
-        final List<Double> latencies;
-        final List<Integer> counts;
+    private static class QueryBenchmarkResult {
+        String system;
+        String queryType;
+        int groupSize;
+        double avgLatencyMs;
+        int queryCount;
+        double totalMs;
+        double qps;
 
-        QueryBenchmarkResult(String system, List<Double> latencies, List<Integer> counts) {
+        QueryBenchmarkResult(String system, String queryType, int groupSize,
+                             double totalMs, int queryCount) {
             this.system = system;
-            this.latencies = new ArrayList<>(latencies);
-            this.counts = counts != null ? new ArrayList<>(counts) : null;
-            this.avgLatency = latencies.stream().mapToDouble(d -> d).average().orElse(0);
-            List<Double> sorted = latencies.stream().sorted().collect(Collectors.toList());
-            this.p50Latency = sorted.isEmpty() ? 0 : sorted.get(sorted.size() / 2);
-            this.p99Latency = sorted.isEmpty() ? 0 : sorted.get(Math.min((int) (sorted.size() * 0.99), sorted.size() - 1));
-            this.minLatency = sorted.isEmpty() ? 0 : sorted.get(0);
-            this.maxLatency = sorted.isEmpty() ? 0 : sorted.get(sorted.size() - 1);
-            this.throughput = avgLatency > 0 ? 1000.0 / avgLatency : 0;
-            this.avgResults = counts != null ? counts.stream().mapToInt(i -> i).average().orElse(0) : 0;
+            this.queryType = queryType;
+            this.groupSize = groupSize;
+            this.totalMs = totalMs;
+            this.queryCount = queryCount;
+            this.avgLatencyMs = queryCount > 0 ? totalMs / queryCount : 0;
+            this.qps = totalMs > 0 ? queryCount / (totalMs / 1000.0) : 0;
+        }
+
+    }
+
+    // ==================== 初始化方法 ====================
+
+    private void initResultDir() {
+        new File(RESULT_DIR).mkdirs();
+    }
+
+    private void initWriters() {
+        try {
+            logWriter = new PrintWriter(new BufferedWriter(
+                    new FileWriter(RESULT_DIR + "experiment9_log.txt", false)));
+        } catch (IOException e) {
+            throw new RuntimeException("Cannot create log writer", e);
+        }
+    }
+
+    private void closeWriters() {
+        if (logWriter != null) {
+            logWriter.flush();
+            logWriter.close();
+        }
+    }
+
+    private void log(String msg) {
+        System.out.println(msg);
+        if (logWriter != null) {
+            logWriter.println(msg);
+            logWriter.flush();
+        }
+    }
+
+    // ==================== 数据加载 ====================
+
+    private Map<Long, String> loadCoordinateMap() throws IOException {
+        Map<Long, String> coordMap = new HashMap<>();
+        String coordFile = DATA_BASE_DIR + "batch_2000000/source_coordinates.csv";
+        File f = new File(coordFile);
+        if (!f.exists()) {
+            coordFile = "gaiadr2/source_coordinates.csv";
+            f = new File(coordFile);
+        }
+        if (!f.exists()) {
+            log("[WARN] 坐标文件不存在: " + coordFile);
+            return coordMap;
+        }
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts[0].equals("source_id")) continue;
+                try {
+                    long sid = Long.parseLong(parts[0].trim());
+                    coordMap.put(sid, parts[1].trim() + "," + parts[2].trim());
+                    double ra = Double.parseDouble(parts[1].trim());
+                    double dec = Double.parseDouble(parts[2].trim());
+                    sourceCoordCache.put(sid, new double[]{ra, dec});
+                } catch (Exception e) {
+                }
+            }
+        }
+        return coordMap;
+    }
+
+    private File[] listAndSortCsvFiles() {
+        File dir = new File(DATA_DIR);
+        if (!dir.exists() || !dir.isDirectory()) {
+            log("[ERROR] 数据目录不存在: " + DATA_DIR);
+            return new File[0];
+        }
+        File[] files = dir.listFiles((d, name) -> name.endsWith(".csv"));
+        if (files == null) return new File[0];
+        Arrays.sort(files, Comparator.comparing(File::getName));
+        return files;
+    }
+
+    // ==================== 系统初始化/关闭 ====================
+
+    private void initAllSystems() {
+        log("[Init] 初始化 LitecsDB...");
+        new File(LITECSDB_PATH).mkdirs();
+        mainNode = new MainNode(NODE_COUNT, HEALPIX_LEVEL, LITECSDB_PATH);
+
+        log("[Init] 初始化 NativeRocksDB...");
+        new File(ROCKSDB_PATH).mkdirs();
+        nativeRocksDB = new NativeRocksDBWrapper(ROCKSDB_PATH);
+
+        log("[Init] 初始化 TDengine...");
+        try {
+            tdengine = new TDengineClientWrapper(TDENGINE_DB);
+        } catch (Exception e) {
+            log("[WARN] TDengine 初始化失败: " + e.getMessage());
+            tdengine = null;
+        }
+
+        log("[Init] 初始化 InfluxDB...");
+        try {
+            influxDB = new InfluxDBClientWrapper(INFLUX_BUCKET);
+        } catch (Exception e) {
+            log("[WARN] InfluxDB 初始化失败: " + e.getMessage());
+            influxDB = null;
+        }
+        log("[Init] 所有系统初始化完成");
+    }
+
+    private void shutdownAllSystems() {
+        log("[Shutdown] 关闭所有系统...");
+        try {
+            if (mainNode != null) mainNode.shutdown();
+        } catch (Exception e) {
+        }
+        try {
+            if (nativeRocksDB != null) nativeRocksDB.close();
+        } catch (Exception e) {
+        }
+        try {
+            if (tdengine != null) tdengine.close();
+        } catch (Exception e) {
+        }
+        try {
+            if (influxDB != null) influxDB.close();
+        } catch (Exception e) {
+        }
+    }
+
+    // ==================== 数据解析 ====================
+
+    private ParseResult parseDeltaFiles(File[] allFiles, int from, int to, Map<Long, String> coordMap)
+            throws IOException {
+        ParseResult result = new ParseResult();
+        for (int i = from; i < to && i < allFiles.length; i++) {
+            try (BufferedReader br = new BufferedReader(new FileReader(allFiles[i]))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    String[] parts = line.split(",");
+                    if (parts[0].equals("source_id")) continue;
+                    try {
+                        long sourceId = Long.parseLong(parts[0].trim());
+                        String coords = coordMap.getOrDefault(sourceId, "0.0,0.0");
+                        String csvLine = parts[0] + "," + coords + "," +
+                                String.join(",", Arrays.copyOfRange(parts, 1, parts.length));
+                        result.csvLines.add(csvLine);
+
+                        String[] fullParts = csvLine.split(",", -1);
+                        if (fullParts.length >= 14) {
+                            double ra = Double.parseDouble(fullParts[1].trim());
+                            double dec = Double.parseDouble(fullParts[2].trim());
+                            LightCurvePoint point = new LightCurvePoint(
+                                    (long) Double.parseDouble(fullParts[0].trim()),
+                                    ra, dec,
+                                    (long) Double.parseDouble(fullParts[3].trim()),
+                                    fullParts[4].trim(),
+                                    Double.parseDouble(fullParts[5].trim()),
+                                    Double.parseDouble(fullParts[6].trim()),
+                                    Double.parseDouble(fullParts[7].trim()),
+                                    Double.parseDouble(fullParts[8].trim()),
+                                    Double.parseDouble(fullParts[9].trim()),
+                                    Boolean.parseBoolean(fullParts[10].trim()),
+                                    Boolean.parseBoolean(fullParts[11].trim()),
+                                    (int) Double.parseDouble(fullParts[12].trim()),
+                                    (long) Double.parseDouble(fullParts[13].trim())
+                            );
+                            result.points.add(point);
+                            loadedSourceIds.add(sourceId);
+                            sourceCoordCache.putIfAbsent(sourceId, new double[]{ra, dec});
+                        }
+                    } catch (Exception e) {
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    // ==================== 写入所有系统 ====================
+
+    private void insertIntoAllSystems(List<LightCurvePoint> points, List<String> csvLines) {
+        // LitecsDB: Phase 1 预创建 + Phase 2 写入
+        if (!phase1Done) {
+            mainNode.preCreateHealpixDatabases(csvLines);
+            phase1Done = true;
+        } else {
+            mainNode.preCreateHealpixDatabases(csvLines);
+        }
+        Map<Long, List<LightCurvePoint>> healpixDataMap = mainNode.preParseData(csvLines);
+        mainNode.distributePreParsedData(healpixDataMap);
+
+        // NativeRocksDB
+        nativeRocksDB.putBatch(points);
+
+        // TDengine
+        if (tdengine != null) {
+            try {
+                tdengine.putBatch(points);
+            } catch (Exception e) {
+                log("[WARN] TDengine 写入失败: " + e.getMessage());
+            }
+        }
+
+        // InfluxDB
+        if (influxDB != null) {
+            try {
+                influxDB.putBatch(points);
+            } catch (Exception e) {
+                log("[WARN] InfluxDB 写入失败: " + e.getMessage());
+            }
+        }
+    }
+
+    private void updateStats(List<LightCurvePoint> points) {
+        for (LightCurvePoint p : points) {
+            if (p.time < globalMinTime) globalMinTime = p.time;
+            if (p.time > globalMaxTime) globalMaxTime = p.time;
+            if (p.mag < globalMinMag) globalMinMag = p.mag;
+            if (p.mag > globalMaxMag) globalMaxMag = p.mag;
+        }
+    }
+
+    private void flushAndBuildIndexes() {
+        log("  [Flush] LitecsDB flush + 构建时间桶索引...");
+        mainNode.forceFlushAllNoCompaction();
+        mainNode.buildAllTimeBucketsOffline();
+
+        log("  [Flush] NativeRocksDB flush...");
+        nativeRocksDB.forceFlush();
+
+        if (tdengine != null) {
+            log("  [Flush] TDengine flush...");
+            tdengine.forceFlush();
+        }
+        if (influxDB != null) {
+            log("  [Flush] InfluxDB flush...");
+            influxDB.forceFlush();
+        }
+    }
+
+    // ==================== 查询生成 ====================
+
+    private List<STMKQueryParams> generateSTMKQueries(int count) {
+        List<STMKQueryParams> queries = new ArrayList<>();
+        List<Long> sids = new ArrayList<>(loadedSourceIds);
+        if (sids.isEmpty()) return queries;
+        Random rng = new Random(42);
+        double timeSpan = globalMaxTime - globalMinTime;
+        for (int i = 0; i < count; i++) {
+            long sid = sids.get(rng.nextInt(sids.size()));
+            double[] coord = sourceCoordCache.get(sid);
+            if (coord == null) continue;
+            double windowSize = timeSpan * (0.05 + rng.nextDouble() * 0.3);
+            double st = globalMinTime + rng.nextDouble() * (timeSpan - windowSize);
+            double et = st + windowSize;
+            String band = BANDS[rng.nextInt(BANDS.length)];
+            queries.add(new STMKQueryParams(coord[0], coord[1], QUERY_RADIUS,
+                    st, et, band, globalMinMag, globalMaxMag, QUERY_MIN_K));
+        }
+        return queries;
+    }
+
+    private List<long[]> generateSimpleQueryTargets(int count) {
+        List<long[]> targets = new ArrayList<>();
+        List<Long> sids = new ArrayList<>(loadedSourceIds);
+        if (sids.isEmpty()) return targets;
+        Random rng = new Random(123);
+        for (int i = 0; i < count; i++) {
+            long sid = sids.get(rng.nextInt(sids.size()));
+            double[] coord = sourceCoordCache.getOrDefault(sid, new double[]{0, 0});
+            targets.add(new long[]{sid, Double.doubleToLongBits(coord[0]),
+                    Double.doubleToLongBits(coord[1])});
+        }
+        return targets;
+    }
+
+    private List<double[]> generateTimeWindows(int count) {
+        List<double[]> windows = new ArrayList<>();
+        Random rng = new Random(456);
+        double timeSpan = globalMaxTime - globalMinTime;
+        for (int i = 0; i < count; i++) {
+            double windowSize = timeSpan * (0.05 + rng.nextDouble() * 0.2);
+            double st = globalMinTime + rng.nextDouble() * (timeSpan - windowSize);
+            windows.add(new double[]{st, st + windowSize});
+        }
+        return windows;
+    }
+
+    private List<String> generateBandList(int count) {
+        List<String> bands = new ArrayList<>();
+        Random rng = new Random(789);
+        for (int i = 0; i < count; i++) {
+            bands.add(BANDS[rng.nextInt(BANDS.length)]);
+        }
+        return bands;
+    }
+
+    // ==================== 查询参数派生 ====================
+
+    private void deriveQueryParams() {
+        simpleQuerySourceIds = new ArrayList<>();
+        List<long[]> targets = generateSimpleQueryTargets(SIMPLE_QUERY_COUNT);
+        for (long[] t : targets) simpleQuerySourceIds.add(t[0]);
+
+        stmkParams = generateSTMKQueries(STMK_QUERY_COUNT);
+        timeRangeWindows = generateTimeWindows(SIMPLE_QUERY_COUNT);
+        bandQueryBands = generateBandList(SIMPLE_QUERY_COUNT);
+    }
+
+    // ==================== 分组基准测试 ====================
+
+    private void runGroupBenchmark(int groupIdx, int groupSize) {
+        log(String.format("\n  [Benchmark] Group %d (size=%d): 开始查询基准测试...", groupIdx + 1, groupSize));
+
+        // 1. 单天体查询
+        simpleResultsByGroup.put(groupIdx, runSimpleQueryBenchmark(groupSize));
+
+        // 2. STMK 查询
+        stmkResultsByGroup.put(groupIdx, runSTMKQueryBenchmark(groupSize));
+
+        // 3. 时间范围查询
+        timeRangeResultsByGroup.put(groupIdx, runTimeRangeQueryBenchmark(groupSize));
+
+        // 4. 聚合查询
+        aggResultsByGroup.put(groupIdx, runAggQueryBenchmark(groupSize));
+
+        // 5. 波段查询
+        bandResultsByGroup.put(groupIdx, runBandQueryBenchmark(groupSize));
+
+        log(String.format("  [Benchmark] Group %d 查询基准测试完成", groupIdx + 1));
+    }
+
+    // ==================== 5种查询基准测试 ====================
+
+    private List<QueryBenchmarkResult> runSimpleQueryBenchmark(int groupSize) {
+        List<QueryBenchmarkResult> results = new ArrayList<>();
+        List<long[]> targets = generateSimpleQueryTargets(Math.min(SIMPLE_QUERY_COUNT, loadedSourceIds.size()));
+        log("    [Simple] 单天体查询 x " + targets.size());
+
+        // LitecsDB
+        {
+            long t0 = System.nanoTime();
+            for (long[] t : targets) {
+                long sid = t[0];
+                double ra = Double.longBitsToDouble(t[1]);
+                double dec = Double.longBitsToDouble(t[2]);
+                long hpid = mainNode.calculateHealpixId(ra, dec);
+                mainNode.getLightCurve(hpid, sid, "G");
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("LitecsDB", "simple", groupSize, totalMs, targets.size()));
+        }
+
+        // NativeRocksDB
+        {
+            long t0 = System.nanoTime();
+            for (long[] t : targets) {
+                nativeRocksDB.queryBySourceId(t[0]);
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("NativeRocksDB", "simple", groupSize, totalMs, targets.size()));
+        }
+
+        // TDengine — 批量并行查询
+        if (tdengine != null) {
+            long t0 = System.nanoTime();
+            tdengine.executeBatchSimpleQueries(targets);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("TDengine", "simple", groupSize, totalMs, targets.size()));
+        }
+
+        // InfluxDB — 批量并行查询
+        if (influxDB != null) {
+            long t0 = System.nanoTime();
+            influxDB.executeBatchSimpleQueries(targets);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("InfluxDB", "simple", groupSize, totalMs, targets.size()));
+        }
+
+        return results;
+    }
+
+    private List<QueryBenchmarkResult> runSTMKQueryBenchmark(int groupSize) {
+        List<QueryBenchmarkResult> results = new ArrayList<>();
+        List<STMKQueryParams> queries = stmkParams;
+        if (queries == null || queries.isEmpty()) return results;
+        log("    [STMK] STMK查询 x " + queries.size());
+
+        List<double[]> batchParams = new ArrayList<>();
+        for (STMKQueryParams q : queries) {
+            double bandCode = q.band.equals("G") ? 0 : q.band.equals("BP") ? 1 : 2;
+            batchParams.add(new double[]{q.ra, q.dec, q.radius, q.startTime, q.endTime,
+                    q.magMin, q.magMax, q.minObs, 0, bandCode});
+        }
+
+        // LitecsDB
+        {
+            long t0 = System.nanoTime();
+            for (STMKQueryParams q : queries) {
+                mainNode.executeSTMKQuery(q.ra, q.dec, q.radius, q.startTime, q.endTime,
+                        q.band, q.magMin, q.magMax, q.minObs);
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("LitecsDB", "STMK", groupSize,
+                    totalMs, queries.size()));
+        }
+
+        // NativeRocksDB
+        {
+            long t0 = System.nanoTime();
+            for (STMKQueryParams q : queries) {
+                nativeRocksDB.executeSTMKQuery(q.startTime, q.endTime, q.band,
+                        q.magMin, q.magMax, q.ra, q.dec, q.radius, q.minObs);
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("NativeRocksDB", "STMK", groupSize,
+                    totalMs, queries.size()));
+        }
+
+        // TDengine — 批量并行查询
+        if (tdengine != null) {
+            long t0 = System.nanoTime();
+            tdengine.executeBatchSTMKQueries(batchParams);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("TDengine", "STMK", groupSize, totalMs, queries.size()));
+        }
+
+        // InfluxDB — 批量并行查询
+        if (influxDB != null) {
+            long t0 = System.nanoTime();
+            influxDB.executeBatchSTMKQueries(batchParams);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("InfluxDB", "STMK", groupSize, totalMs, queries.size()));
+        }
+
+        return results;
+    }
+
+    private List<QueryBenchmarkResult> runTimeRangeQueryBenchmark(int groupSize) {
+        List<QueryBenchmarkResult> results = new ArrayList<>();
+        List<long[]> targets = generateSimpleQueryTargets(Math.min(SIMPLE_QUERY_COUNT, loadedSourceIds.size()));
+        List<double[]> windows = timeRangeWindows;
+        int count = Math.min(targets.size(), windows.size());
+        log("    [TimeRange] 时间范围查询 x " + count);
+
+        // LitecsDB
+        {
+            long t0 = System.nanoTime();
+            for (int i = 0; i < count; i++) {
+                long sid = targets.get(i)[0];
+                double ra = Double.longBitsToDouble(targets.get(i)[1]);
+                double dec = Double.longBitsToDouble(targets.get(i)[2]);
+                long hpid = mainNode.calculateHealpixId(ra, dec);
+                mainNode.getLightCurve(hpid, sid, "G");
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("LitecsDB", "timeRange", groupSize, totalMs, count));
+        }
+
+        // NativeRocksDB
+        {
+            long t0 = System.nanoTime();
+            for (int i = 0; i < count; i++) {
+                nativeRocksDB.queryBySourceIdTimeRange(targets.get(i)[0], windows.get(i)[0], windows.get(i)[1]);
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("NativeRocksDB", "timeRange", groupSize, totalMs, count));
+        }
+
+        // TDengine — 批量并行查询
+        if (tdengine != null) {
+            long t0 = System.nanoTime();
+            tdengine.executeBatchTimeRangeQueries(targets, windows);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("TDengine", "timeRange", groupSize, totalMs, count));
+        }
+
+        // InfluxDB — 批量并行查询
+        if (influxDB != null) {
+            long t0 = System.nanoTime();
+            influxDB.executeBatchTimeRangeQueries(targets, windows);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("InfluxDB", "timeRange", groupSize, totalMs, count));
+        }
+
+        return results;
+    }
+
+    private List<QueryBenchmarkResult> runAggQueryBenchmark(int groupSize) {
+        List<QueryBenchmarkResult> results = new ArrayList<>();
+        List<long[]> targets = generateSimpleQueryTargets(Math.min(SIMPLE_QUERY_COUNT, loadedSourceIds.size()));
+        log("    [Agg] 聚合查询 x " + targets.size());
+
+        // LitecsDB — 获取光变曲线后本地聚合
+        {
+            long t0 = System.nanoTime();
+            for (long[] t : targets) {
+                long sid = t[0];
+                double ra = Double.longBitsToDouble(t[1]);
+                double dec = Double.longBitsToDouble(t[2]);
+                long hpid = mainNode.calculateHealpixId(ra, dec);
+                List<LightCurvePoint> pts = mainNode.getLightCurve(hpid, sid, "G");
+                if (pts != null && !pts.isEmpty()) {
+                    double sum = 0, min = Double.MAX_VALUE, max = Double.MIN_VALUE;
+                    for (LightCurvePoint p : pts) {
+                        sum += p.mag; min = Math.min(min, p.mag); max = Math.max(max, p.mag);
+                    }
+                }
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("LitecsDB", "aggregation", groupSize, totalMs, targets.size()));
+        }
+
+        // NativeRocksDB
+        {
+            long t0 = System.nanoTime();
+            for (long[] t : targets) {
+                List<LightCurvePoint> pts = nativeRocksDB.queryBySourceIdFull(t[0]);
+                if (pts != null && !pts.isEmpty()) {
+                    double sum = 0, min = Double.MAX_VALUE, max = Double.MIN_VALUE;
+                    for (LightCurvePoint p : pts) {
+                        sum += p.mag; min = Math.min(min, p.mag); max = Math.max(max, p.mag);
+                    }
+                }
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("NativeRocksDB", "aggregation", groupSize, totalMs, targets.size()));
+        }
+
+        // TDengine — 批量并行查询
+        if (tdengine != null) {
+            long t0 = System.nanoTime();
+            tdengine.executeBatchAggregationQueries(targets);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("TDengine", "aggregation", groupSize, totalMs, targets.size()));
+        }
+
+        // InfluxDB — 批量并行查询
+        if (influxDB != null) {
+            long t0 = System.nanoTime();
+            influxDB.executeBatchAggregationQueries(targets);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("InfluxDB", "aggregation", groupSize, totalMs, targets.size()));
+        }
+
+        return results;
+    }
+
+    private List<QueryBenchmarkResult> runBandQueryBenchmark(int groupSize) {
+        List<QueryBenchmarkResult> results = new ArrayList<>();
+        List<long[]> targets = generateSimpleQueryTargets(Math.min(SIMPLE_QUERY_COUNT, loadedSourceIds.size()));
+        List<String> bands = bandQueryBands;
+        int count = Math.min(targets.size(), bands.size());
+        log("    [Band] 波段查询 x " + count);
+
+        // LitecsDB
+        {
+            long t0 = System.nanoTime();
+            for (int i = 0; i < count; i++) {
+                long sid = targets.get(i)[0];
+                double ra = Double.longBitsToDouble(targets.get(i)[1]);
+                double dec = Double.longBitsToDouble(targets.get(i)[2]);
+                long hpid = mainNode.calculateHealpixId(ra, dec);
+                mainNode.getLightCurve(hpid, sid, bands.get(i));
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("LitecsDB", "band", groupSize, totalMs, count));
+        }
+
+        // NativeRocksDB
+        {
+            long t0 = System.nanoTime();
+            for (int i = 0; i < count; i++) {
+                nativeRocksDB.queryBySourceIdBand(targets.get(i)[0], bands.get(i));
+            }
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("NativeRocksDB", "band", groupSize, totalMs, count));
+        }
+
+        // TDengine — 批量并行查询
+        if (tdengine != null) {
+            long t0 = System.nanoTime();
+            tdengine.executeBatchBandQueries(targets, bands);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("TDengine", "band", groupSize, totalMs, count));
+        }
+
+        // InfluxDB — 批量并行查询
+        if (influxDB != null) {
+            long t0 = System.nanoTime();
+            influxDB.executeBatchBandQueries(targets, bands);
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            results.add(new QueryBenchmarkResult("InfluxDB", "band", groupSize, totalMs, count));
+        }
+
+        return results;
+    }
+
+    // ==================== 报告输出 ====================
+
+    private void printGroupedSummaryReport() {
+        log("\n========== Experiment 9 综合查询性能报告 ==========\n");
+        String[] queryTypes = {"simple", "STMK", "timeRange", "aggregation", "band"};
+        Map<String, Map<Integer, List<QueryBenchmarkResult>>> allMaps = new LinkedHashMap<>();
+        allMaps.put("simple", simpleResultsByGroup);
+        allMaps.put("STMK", stmkResultsByGroup);
+        allMaps.put("timeRange", timeRangeResultsByGroup);
+        allMaps.put("aggregation", aggResultsByGroup);
+        allMaps.put("band", bandResultsByGroup);
+
+        for (String qt : queryTypes) {
+            Map<Integer, List<QueryBenchmarkResult>> groupMap = allMaps.get(qt);
+            if (groupMap == null || groupMap.isEmpty()) continue;
+            log(String.format("--- 查询类型: %s ---", qt));
+            log(String.format("%-14s %-10s %-12s %-10s %-10s",
+                    "System", "GroupSize", "AvgLatency", "TotalMs", "QPS"));
+            for (Map.Entry<Integer, List<QueryBenchmarkResult>> entry : groupMap.entrySet()) {
+                for (QueryBenchmarkResult r : entry.getValue()) {
+                    log(String.format("%-14s %-10d %-12.2f %-10.2f %-10.2f",
+                            r.system, r.groupSize, r.avgLatencyMs,
+                            r.totalMs, r.qps));
+                }
+            }
+            log("");
+        }
+    }
+
+    private void exportGroupedCSV() {
+        String csvFile = RESULT_DIR + "experiment9_query_results.csv";
+        log("[Export] 导出CSV: " + csvFile);
+        try (PrintWriter pw = new PrintWriter(new BufferedWriter(
+                new FileWriter(csvFile)))) {
+            pw.println("system,queryType,groupSize,avgLatencyMs,queryCount,totalMs,qps");
+            Map<String, Map<Integer, List<QueryBenchmarkResult>>> allMaps
+                    = new LinkedHashMap<>();
+            allMaps.put("simple", simpleResultsByGroup);
+            allMaps.put("STMK", stmkResultsByGroup);
+            allMaps.put("timeRange", timeRangeResultsByGroup);
+            allMaps.put("aggregation", aggResultsByGroup);
+            allMaps.put("band", bandResultsByGroup);
+            for (Map.Entry<String, Map<Integer, List<QueryBenchmarkResult>>> e
+                    : allMaps.entrySet()) {
+                if (e.getValue() == null) continue;
+                for (Map.Entry<Integer, List<QueryBenchmarkResult>> ge
+                        : e.getValue().entrySet()) {
+                    for (QueryBenchmarkResult r : ge.getValue()) {
+                        pw.printf("%s,%s,%d,%.2f,%d,%.2f,%.2f%n",
+                                r.system, r.queryType, r.groupSize,
+                                r.avgLatencyMs, r.queryCount, r.totalMs, r.qps);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            log("[ERROR] CSV导出失败: " + e.getMessage());
         }
     }
 }

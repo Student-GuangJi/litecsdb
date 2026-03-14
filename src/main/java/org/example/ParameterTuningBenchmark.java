@@ -49,8 +49,8 @@ public class ParameterTuningBenchmark {
     static final boolean DEF_NO_WAL    = false;
 
     // =============== 实验控制 ===============
-    static final int REPS   = 1;
-    static final int WARMUP = 0;
+    static final int REPS   = 3;
+    static final int WARMUP = 1;
     static final String OUT_DIR = "experiment_results/";
     static final String TMP_DIR = "experiment_tmp/";
 
@@ -91,11 +91,11 @@ public class ParameterTuningBenchmark {
         execMainNode(baseline(), "BASELINE", "DEFAULT");
 
         // 实验 1: WRITE_THREADS
-//        section("Exp 1/7: WRITE_THREADS");
-//        for (int v : new int[]{1, 2, 4, 8, 16, 32}) {
-//            Cfg c = baseline(); c.threads = v;
-//            execMainNode(c, "WRITE_THREADS", String.valueOf(v));
-//        }
+        section("Exp 1/7: WRITE_THREADS");
+        for (int v : new int[]{128,256,512}) {
+            Cfg c = baseline(); c.threads = v;
+            execMainNode(c, "WRITE_THREADS", String.valueOf(v));
+        }
 
         // 实验 2: BATCH_SIZE
 //        section("Exp 2/7: BATCH_SIZE");
@@ -112,11 +112,11 @@ public class ParameterTuningBenchmark {
 //        }
 
         // 实验 4: HEALPIX_LEVEL
-        section("Exp 4/7: HEALPIX_LEVEL");
-        for (int v : new int[]{5}) {
-            Cfg c = baseline(); c.level = v;
-            execMainNode(c, "HEALPIX_LEVEL", String.valueOf(v));
-        }
+//        section("Exp 4/7: HEALPIX_LEVEL");
+//        for (int v : new int[]{0,1,2,3,4}) {
+//            Cfg c = baseline(); c.level = v;
+//            execMainNode(c, "HEALPIX_LEVEL", String.valueOf(v));
+//        }
 
         // 实验 5: WRITE_BUFFER_SIZE_MB（需要自定义 RocksDB 参数）
 //        section("Exp 5/7: WRITE_BUFFER_SIZE_MB");

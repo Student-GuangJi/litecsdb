@@ -77,7 +77,7 @@ public class InfluxDBClientWrapper implements AutoCloseable {
 
         this.numConnections = Integer.parseInt(System.getenv().getOrDefault("INFLUX_CONNECTIONS", "32"));
         this.writeThreads = Integer.parseInt(System.getenv().getOrDefault("INFLUX_WRITE_THREADS", "16"));
-        this.queryThreads = Integer.parseInt(System.getenv().getOrDefault("INFLUX_QUERY_THREADS", "8"));
+        this.queryThreads = Integer.parseInt(System.getenv().getOrDefault("INFLUX_QUERY_THREADS", "32"));
         this.batchSize = Integer.parseInt(System.getenv().getOrDefault("INFLUX_BATCH_SIZE", "10000"));
 
         this.clients = new InfluxDBClient[numConnections];
@@ -179,148 +179,6 @@ public class InfluxDBClientWrapper implements AutoCloseable {
         }
     }
 
-    // ==================== 查询 ====================
-
-    public void clearQueryCache() {
-        try {
-            for (int i = 0; i < numConnections; i++) { if (clients[i] != null) clients[i].close(); }
-            Thread.sleep(1000);
-            for (int i = 0; i < numConnections; i++) { clients[i] = createClient(); writeApis[i] = clients[i].getWriteApiBlocking(); }
-        } catch (Exception e) { System.err.println("[WARN] InfluxDB cache clear failed: " + e.getMessage()); }
-    }
-
-    /**
-     * 简单查询：按 source_id 返回该天体全部观测数据（每行每列）
-     *
-     * source_id 是 tag → TSI 索引高效定位，遍历所有 measurement(hp_*)
-     * 用 pivot 展开所有 field 为宽表
-     */
-    public List<String> executeSimpleQuery(long sourceId) {
-        String flux = String.format(
-                "from(bucket: \"%s\") " +
-                        "|> range(start: 0) " +
-                        "|> filter(fn: (r) => r.source_id == \"%d\") " +
-                        "|> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")",
-                bucket, sourceId);
-        return executeFluxQueryReturnRows(flux);
-    }
-
-    /**
-     * STMK 查询 — HEALPix 天区剪枝优化
-     *
-     * 步骤:
-     *   1. queryDisc(ra,dec,radius) → 天区 ID 集合
-     *   2. 只查目标天区 measurement "hp_{id}"
-     *   3. time range + mag filter + group by source_id + count
-     *   4. count >= minObs 过滤
-     *   5. 从 tag 取 ra/dec → 精确 cone search
-     *   6. 返回匹配的 source_id 列表
-     */
-    public List<Long> executeSTMKQuery(double ra, double dec, double radius,
-                                       double startTime, double endTime,
-                                       double magMin, double magMax, int minObs) {
-        long startMs = GAIA_EPOCH_UNIX_MS + (long) (startTime * MS_PER_DAY);
-        long endMs = GAIA_EPOCH_UNIX_MS + (long) (endTime * MS_PER_DAY);
-
-        // Step 1: HEALPix 天区剪枝
-        Set<Long> healpixIds = calculateHealpixIdsInCone(ra, dec, radius);
-        if (healpixIds.isEmpty()) return Collections.emptyList();
-
-        // Step 2: 构建 measurement 过滤条件
-        StringBuilder mFilter = new StringBuilder();
-        boolean first = true;
-        for (Long hpid : healpixIds) {
-            if (!first) mFilter.append(" or ");
-            mFilter.append("r._measurement == \"hp_").append(hpid).append("\"");
-            first = false;
-        }
-
-        // Step 3: Flux 查询 — 时间+星等+计数
-        String flux = String.format(Locale.US,
-                "from(bucket: \"%s\") " +
-                        "|> range(start: %d, stop: %d) " +
-                        "|> filter(fn: (r) => %s) " +
-                        "|> filter(fn: (r) => r._field == \"mag\") " +
-                        "|> filter(fn: (r) => r._value >= %f and r._value <= %f) " +
-                        "|> group(columns: [\"source_id\"]) " +
-                        "|> count() " +
-                        "|> filter(fn: (r) => r._value >= %d)",
-                bucket, startMs, endMs, mFilter.toString(), magMin, magMax, minObs);
-
-        // Step 4: 获取候选 source_id
-        List<Long> candidateIds = executeFluxQueryGetSourceIds(flux);
-        if (candidateIds.isEmpty()) return Collections.emptyList();
-
-        // Step 5: 精确 cone search 空间过滤（从 tag 读 ra/dec）
-        List<Long> matchedIds = Collections.synchronizedList(new ArrayList<>());
-        CountDownLatch latch = new CountDownLatch(candidateIds.size());
-        for (long sid : candidateIds) {
-            queryPool.submit(() -> {
-                try {
-                    double[] coord = getSourceCoordFromTag(sid);
-                    if (coord != null && isInCone(coord[0], coord[1], ra, dec, radius)) {
-                        matchedIds.add(sid);
-                    }
-                } catch (Exception e) { /* ignore */ }
-                finally { latch.countDown(); }
-            });
-        }
-        try { latch.await(120, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        return matchedIds;
-    }
-
-    /** 从 tag 读取天体坐标（ra/dec 现在是 tag，一条查询即可获取） */
-    private double[] getSourceCoordFromTag(long sourceId) {
-        String flux = String.format(
-                "from(bucket: \"%s\") |> range(start: 0) " +
-                        "|> filter(fn: (r) => r.source_id == \"%d\") |> first()",
-                bucket, sourceId);
-        try {
-            HttpURLConnection conn = openFluxConnection(120000);
-            try (OutputStream os = conn.getOutputStream()) { os.write(flux.getBytes()); }
-            if (conn.getResponseCode() != 200) return null;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line; String header = null; int raCol = -1, decCol = -1;
-                while ((line = reader.readLine()) != null) {
-                    if (line.isEmpty()) { header = null; continue; }
-                    if (line.startsWith("#")) continue;
-                    if (header == null) {
-                        header = line;
-                        String[] cols = line.split(",");
-                        for (int i = 0; i < cols.length; i++) {
-                            if ("ra".equals(cols[i].trim())) raCol = i;
-                            if ("dec".equals(cols[i].trim())) decCol = i;
-                        }
-                        continue;
-                    }
-                    if (raCol >= 0 && decCol >= 0) {
-                        String[] parts = line.split(",");
-                        if (parts.length > Math.max(raCol, decCol)) {
-                            return new double[]{
-                                    Double.parseDouble(parts[raCol].trim()),
-                                    Double.parseDouble(parts[decCol].trim())};
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) { /* ignore */ }
-        return null;
-    }
-
-    /** HEALPix cone search 计算涉及天区 */
-    private Set<Long> calculateHealpixIdsInCone(double ra, double dec, double radius) {
-        Set<Long> ids = new HashSet<>();
-        try {
-            new HealpixUtil().setNside(HEALPIX_LEVEL);
-            RangeSet rs = HealpixUtil.queryDisc(ra, dec, radius, HEALPIX_LEVEL);
-            if (rs != null) {
-                for (int i = 0; i < rs.nranges(); i++)
-                    for (long pix = rs.ivbegin(i); pix <= rs.ivend(i); pix++) ids.add(pix);
-            }
-        } catch (Exception e) { System.err.println("[WARN] HEALPix queryDisc failed: " + e.getMessage()); }
-        return ids;
-    }
-
     // ==================== Flux 基础方法 ====================
 
     private HttpURLConnection openFluxConnection(int readTimeout) throws Exception {
@@ -392,6 +250,228 @@ public class InfluxDBClientWrapper implements AutoCloseable {
             }
             return Math.max(0, count - 1);
         } catch (Exception e) { return 0; }
+    }
+
+    // ==================== 批量并行查询接口 ====================
+
+    /** 批量并行简单查询（自包含），返回 int[]（每个查询的行数） */
+    public List<int[]> executeBatchSimpleQueries(List<long[]> sourceIdsWithCoords) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (long[] q : sourceIdsWithCoords) {
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    long startNs = GAIA_EPOCH_UNIX_MS * 1_000_000L;
+                    long endNs = (GAIA_EPOCH_UNIX_MS + 4000L * MS_PER_DAY) * 1_000_000L;
+                    String flux = String.format(
+                            "from(bucket: \"%s\") " +
+                                    "|> range(start: %d, stop: %d) " +
+                                    "|> filter(fn: (r) => r._measurement == \"hp_%d\" and r.source_id == \"%d\" and r._field == \"mag\")",
+                            bucket, startNs, endNs, hpid, sourceId);
+                    results.add(new int[]{executeFluxQueryHttp(flux)});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行 STMK 查询（自包含），返回 int[]（每个查询匹配的sourceId数） */
+    public List<int[]> executeBatchSTMKQueries(List<double[]> paramsList) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(paramsList.size());
+        for (double[] p : paramsList) {
+            queryPool.submit(() -> {
+                try {
+                    double ra = p[0], dec = p[1], radius = p[2];
+                    double startTime = p[3], endTime = p[4];
+                    double magMin = p[5], magMax = p[6];
+                    int minObs = (int) p[7];
+                    String band = p.length > 9 ? bandFromCode((int) p[9]) : null;
+
+                    long startNs = (GAIA_EPOCH_UNIX_MS + (long)(startTime * MS_PER_DAY)) * 1_000_000L;
+                    long endNs = (GAIA_EPOCH_UNIX_MS + (long)(endTime * MS_PER_DAY)) * 1_000_000L;
+
+                    Set<Long> hpids = new HashSet<>();
+                    try {
+                        new HealpixUtil().setNside(HEALPIX_LEVEL);
+                        RangeSet rangeSet = HealpixUtil.queryDisc(ra, dec, radius, HEALPIX_LEVEL);
+                        if (rangeSet != null) for (int i = 0; i < rangeSet.nranges(); i++)
+                            for (long px = rangeSet.ivbegin(i); px <= rangeSet.ivend(i); px++) hpids.add(px);
+                    } catch (Exception e) {}
+                    if (hpids.isEmpty()) { results.add(new int[]{0}); return; }
+
+                    StringBuilder mFilter = new StringBuilder();
+                    boolean first = true;
+                    for (Long hpid : hpids) {
+                        if (!first) mFilter.append(" or ");
+                        mFilter.append("r._measurement == \"hp_").append(hpid).append("\"");
+                        first = false;
+                    }
+                    String bandFilter = (band != null && !band.isEmpty())
+                            ? String.format(" |> filter(fn: (r) => r.band == \"%s\")", band) : "";
+
+                    String flux = String.format(Locale.US,
+                            "from(bucket: \"%s\") " +
+                                    "|> range(start: %d, stop: %d) " +
+                                    "|> filter(fn: (r) => (%s) and r._field == \"mag\" and r._value >= %f and r._value <= %f)%s " +
+                                    "|> group(columns: [\"source_id\", \"ra\", \"dec\"]) " +
+                                    "|> count() " +
+                                    "|> filter(fn: (r) => r._value >= %d)",
+                            bucket, startNs, endNs, mFilter.toString(), magMin, magMax, bandFilter, minObs);
+
+                    int matched = 0;
+                    HttpURLConnection conn = openFluxConnection(600000);
+                    try (OutputStream os = conn.getOutputStream()) { os.write(flux.getBytes()); }
+                    if (conn.getResponseCode() == 200) {
+                        try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                            String line; int sidCol = -1, raCol = -1, decCol = -1;
+                            while ((line = reader.readLine()) != null) {
+                                if (line.isEmpty()) { sidCol = -1; raCol = -1; decCol = -1; continue; }
+                                if (line.startsWith("#")) continue;
+                                String[] parts = line.split(",");
+                                if (sidCol < 0) {
+                                    for (int j = 0; j < parts.length; j++) {
+                                        String col = parts[j].trim();
+                                        if ("source_id".equals(col)) sidCol = j;
+                                        else if ("ra".equals(col)) raCol = j;
+                                        else if ("dec".equals(col)) decCol = j;
+                                    }
+                                    continue;
+                                }
+                                if (parts.length > Math.max(sidCol, Math.max(raCol, decCol))) {
+                                    try {
+                                        if (raCol >= 0 && decCol >= 0) {
+                                            double sra = Double.parseDouble(parts[raCol].trim());
+                                            double sdec = Double.parseDouble(parts[decCol].trim());
+                                            if (isInCone(sra, sdec, ra, dec, radius)) matched++;
+                                        } else { matched++; }
+                                    } catch (NumberFormatException e) {}
+                                }
+                            }
+                        }
+                    }
+                    results.add(new int[]{matched});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(600, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行时间范围查询（自包含），返回 int[]（每个查询的行数） */
+    public List<int[]> executeBatchTimeRangeQueries(List<long[]> sourceIdsWithCoords, List<double[]> timeWindows) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (int idx = 0; idx < sourceIdsWithCoords.size(); idx++) {
+            final long[] q = sourceIdsWithCoords.get(idx);
+            final double[] tw = timeWindows.get(idx);
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    long startNs = (GAIA_EPOCH_UNIX_MS + (long)(tw[0] * MS_PER_DAY)) * 1_000_000L;
+                    long endNs = (GAIA_EPOCH_UNIX_MS + (long)(tw[1] * MS_PER_DAY)) * 1_000_000L;
+                    String flux = String.format(
+                            "from(bucket: \"%s\") " +
+                                    "|> range(start: %d, stop: %d) " +
+                                    "|> filter(fn: (r) => r._measurement == \"hp_%d\" and r.source_id == \"%d\" and r._field == \"mag\")",
+                            bucket, startNs, endNs, hpid, sourceId);
+                    results.add(new int[]{executeFluxQueryHttp(flux)});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行聚合统计查询（自包含），返回 double[][]{count, avgMag} */
+    public List<double[]> executeBatchAggregationQueries(List<long[]> sourceIdsWithCoords) {
+        List<double[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (long[] q : sourceIdsWithCoords) {
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    long startNs = GAIA_EPOCH_UNIX_MS * 1_000_000L;
+                    long endNs = (GAIA_EPOCH_UNIX_MS + 4000L * MS_PER_DAY) * 1_000_000L;
+                    String flux = String.format(
+                            "from(bucket: \"%s\") " +
+                                    "|> range(start: %d, stop: %d) " +
+                                    "|> filter(fn: (r) => r._measurement == \"hp_%d\" and r.source_id == \"%d\" and r._field == \"mag\") " +
+                                    "|> group() " +
+                                    "|> mean()",
+                            bucket, startNs, endNs, hpid, sourceId);
+                    double avgMag = 0;
+                    List<String> rows = executeFluxQueryReturnRows(flux);
+                    if (!rows.isEmpty()) {
+                        String[] parts = rows.get(0).split(",");
+                        if (parts.length > 0) {
+                            try { avgMag = Double.parseDouble(parts[parts.length - 1].trim()); } catch (Exception e) {}
+                        }
+                    }
+                    results.add(new double[]{rows.size(), avgMag});
+                } catch (Exception e) {
+                    results.add(new double[]{0, 0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    /** 批量并行单波段查询（自包含），返回 int[]（每个查询的行数） */
+    public List<int[]> executeBatchBandQueries(List<long[]> sourceIdsWithCoords, List<String> bands) {
+        List<int[]> results = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch latch = new CountDownLatch(sourceIdsWithCoords.size());
+        for (int idx = 0; idx < sourceIdsWithCoords.size(); idx++) {
+            final long[] q = sourceIdsWithCoords.get(idx);
+            final String band = bands.get(idx);
+            queryPool.submit(() -> {
+                try {
+                    long sourceId = q[0];
+                    double ra = Double.longBitsToDouble(q[1]);
+                    double dec = Double.longBitsToDouble(q[2]);
+                    long hpid = HealpixUtil.raDecToHealpix(ra, dec, HEALPIX_LEVEL);
+                    long startNs = GAIA_EPOCH_UNIX_MS * 1_000_000L;
+                    long endNs = (GAIA_EPOCH_UNIX_MS + 4000L * MS_PER_DAY) * 1_000_000L;
+                    String flux = String.format(
+                            "from(bucket: \"%s\") " +
+                                    "|> range(start: %d, stop: %d) " +
+                                    "|> filter(fn: (r) => r._measurement == \"hp_%d\" and r.source_id == \"%d\" and r.band == \"%s\" and r._field == \"mag\")",
+                            bucket, startNs, endNs, hpid, sourceId, band);
+                    results.add(new int[]{executeFluxQueryHttp(flux)});
+                } catch (Exception e) {
+                    results.add(new int[]{0});
+                } finally { latch.countDown(); }
+            });
+        }
+        try { latch.await(300, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return results;
+    }
+
+    private static String bandFromCode(int code) {
+        switch (code) { case 1: return "G"; case 2: return "BP"; case 3: return "RP"; default: return null; }
+    }
+
+    private static int bandToCode(String band) {
+        if (band == null) return 0;
+        switch (band) { case "G": return 1; case "BP": return 2; case "RP": return 3; default: return 0; }
     }
 
     // ==================== 空间工具 ====================

@@ -211,7 +211,7 @@ public class StorageNode {
             return Collections.emptyList();
         }
         try {
-            return dbService.getLightCurve(sourceId);
+            return dbService.getLightCurveByBand(sourceId, band);
         } catch (Exception e) {
             System.err.println("Failed to get light curve for source " + sourceId + " in HEALPix " + healpixId + ": " + e.getMessage());
             e.printStackTrace();

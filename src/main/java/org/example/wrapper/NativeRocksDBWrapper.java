@@ -5,6 +5,8 @@ import org.example.RocksDBGlobalResourceManager;
 import org.example.utils.StorageUtils;
 
 import org.rocksdb.*;
+import org.rocksdb.Cache;
+import org.rocksdb.LRUCache;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -29,10 +31,10 @@ public class NativeRocksDBWrapper implements AutoCloseable {
 
     private final String dbPath;
     private RocksDB db;
-    private final ColumnFamilyHandle[] cfHandles;
+    private ColumnFamilyHandle[] cfHandles;
     private final ExecutorService writePool;
-    private final WriteOptions writeOptions;
-    private final ReadOptions readOptions;
+    private WriteOptions writeOptions;
+    private ReadOptions readOptions;
 
     private final AtomicLong logicalBytesWritten = new AtomicLong(0);
     private long initialDirSize = 0;
@@ -159,33 +161,39 @@ public class NativeRocksDBWrapper implements AutoCloseable {
     }
 
     /**
-     * 简单查询：按sourceId前缀扫描
+     * 简单查询：按sourceId前缀扫描，返回行数
      */
     public int queryBySourceId(long sourceId) {
+        return queryBySourceIdFull(sourceId).size();
+    }
+
+    /**
+     * 简单查询：按sourceId前缀扫描，返回完整数据
+     */
+    public List<LightCurvePoint> queryBySourceIdFull(long sourceId) {
         int cfIdx = (int) (Math.abs(sourceId) % NUM_CF);
         ColumnFamilyHandle cfh = cfHandles[cfIdx];
 
-        // 构建前缀key
         ByteBuffer prefixBuf = ByteBuffer.allocate(8);
         prefixBuf.putLong(sourceId);
         byte[] prefix = prefixBuf.array();
 
-        int count = 0;
+        List<LightCurvePoint> results = new ArrayList<>();
         try (RocksIterator it = db.newIterator(cfh, readOptions)) {
             it.seek(prefix);
             while (it.isValid()) {
                 byte[] key = it.key();
-                // 检查前缀是否匹配
                 if (key.length >= 8) {
                     ByteBuffer keyBuf = ByteBuffer.wrap(key);
                     long keySid = keyBuf.getLong();
                     if (keySid != sourceId) break;
-                    count++;
+                    LightCurvePoint p = deserializePoint(it.value());
+                    if (p != null) results.add(p);
                 }
                 it.next();
             }
         }
-        return count;
+        return results;
     }
 
     /**
@@ -263,6 +271,85 @@ public class NativeRocksDBWrapper implements AutoCloseable {
         return count;
     }
 
+    /**
+     * 时间范围查询：按sourceId前缀扫描 + 时间过滤
+     */
+    public List<LightCurvePoint> queryBySourceIdTimeRange(long sourceId, double startTime, double endTime) {
+        int cfIdx = (int) (Math.abs(sourceId) % NUM_CF);
+        ColumnFamilyHandle cfh = cfHandles[cfIdx];
+        ByteBuffer prefixBuf = ByteBuffer.allocate(8);
+        prefixBuf.putLong(sourceId);
+        byte[] prefix = prefixBuf.array();
+        List<LightCurvePoint> results = new ArrayList<>();
+        try (RocksIterator it = db.newIterator(cfh, readOptions)) {
+            it.seek(prefix);
+            while (it.isValid()) {
+                byte[] key = it.key();
+                if (key.length >= 8) {
+                    ByteBuffer keyBuf = ByteBuffer.wrap(key);
+                    long keySid = keyBuf.getLong();
+                    if (keySid != sourceId) break;
+                    LightCurvePoint p = deserializePoint(it.value());
+                    if (p != null && p.time >= startTime && p.time <= endTime) results.add(p);
+                }
+                it.next();
+            }
+        }
+        return results;
+    }
+
+    /**
+     * 聚合统计查询：按sourceId前缀扫描，返回 double[]{count, avgMag, minMag, maxMag}
+     */
+    public double[] queryAggregation(long sourceId) {
+        int cfIdx = (int) (Math.abs(sourceId) % NUM_CF);
+        ColumnFamilyHandle cfh = cfHandles[cfIdx];
+        ByteBuffer prefixBuf = ByteBuffer.allocate(8);
+        prefixBuf.putLong(sourceId);
+        byte[] prefix = prefixBuf.array();
+        int count = 0; double sum = 0, min = Double.MAX_VALUE, max = -Double.MAX_VALUE;
+        try (RocksIterator it = db.newIterator(cfh, readOptions)) {
+            it.seek(prefix);
+            while (it.isValid()) {
+                byte[] key = it.key();
+                if (key.length >= 8) {
+                    ByteBuffer keyBuf = ByteBuffer.wrap(key);
+                    if (keyBuf.getLong() != sourceId) break;
+                    LightCurvePoint p = deserializePoint(it.value());
+                    if (p != null) { count++; sum += p.mag; if (p.mag < min) min = p.mag; if (p.mag > max) max = p.mag; }
+                }
+                it.next();
+            }
+        }
+        return new double[]{count, count > 0 ? sum / count : 0, count > 0 ? min : 0, count > 0 ? max : 0};
+    }
+
+    /**
+     * 单波段查询：按sourceId前缀扫描 + band过滤
+     */
+    public List<LightCurvePoint> queryBySourceIdBand(long sourceId, String band) {
+        int cfIdx = (int) (Math.abs(sourceId) % NUM_CF);
+        ColumnFamilyHandle cfh = cfHandles[cfIdx];
+        ByteBuffer prefixBuf = ByteBuffer.allocate(8);
+        prefixBuf.putLong(sourceId);
+        byte[] prefix = prefixBuf.array();
+        List<LightCurvePoint> results = new ArrayList<>();
+        try (RocksIterator it = db.newIterator(cfh, readOptions)) {
+            it.seek(prefix);
+            while (it.isValid()) {
+                byte[] key = it.key();
+                if (key.length >= 8) {
+                    ByteBuffer keyBuf = ByteBuffer.wrap(key);
+                    if (keyBuf.getLong() != sourceId) break;
+                    LightCurvePoint p = deserializePoint(it.value());
+                    if (p != null && p.band.equals(band)) results.add(p);
+                }
+                it.next();
+            }
+        }
+        return results;
+    }
+
     private boolean isInCone(double ra1, double dec1, double ra2, double dec2, double radius) {
         double ra1R = Math.toRadians(ra1), dec1R = Math.toRadians(dec1);
         double ra2R = Math.toRadians(ra2), dec2R = Math.toRadians(dec2);
@@ -333,18 +420,48 @@ public class NativeRocksDBWrapper implements AutoCloseable {
     }
 
     /**
-     * 清除查询缓存（Block Cache），确保查询公平性
-     * 通过关闭并重建 block cache 或清空缓存来消除缓存优势
+     * 清除查询缓存 — 关闭并重新打开 DB，使用独立 block cache
+     * 确保查询不使用任何缓存数据，保证公平对比
      */
     public void clearQueryCache() {
         try {
-            // Flush 所有 memtable 到磁盘，确保数据持久化
+            // 1. 关闭当前 DB 和 handles
+            if (readOptions != null) readOptions.close();
+            if (writeOptions != null) writeOptions.close();
             for (ColumnFamilyHandle cfh : cfHandles) {
-                db.flush(new FlushOptions().setWaitForFlush(true), cfh);
+                if (cfh != null) cfh.close();
             }
-            // 注意：RocksDB Java API 没有直接的 block cache 清空方法
-            // 通过显式 compact 强制更新 SST 文件索引，使旧缓存失效
-            // 实际生产中可通过重新打开 DB 来彻底清除缓存
+            db.close();
+
+            // 2. 使用独立的新 block cache 重新打开（不共享全局缓存）
+            Cache freshCache = new LRUCache(64 * 1024 * 1024); // 64MB 独立 cache
+            BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
+                    .setBlockCache(freshCache)
+                    .setNoBlockCache(false);
+
+            DBOptions dbOptions = new DBOptions()
+                    .setCreateIfMissing(false)
+                    .setCreateMissingColumnFamilies(false)
+                    .setMaxBackgroundJobs(4);
+
+            ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
+                    .setCompressionType(CompressionType.LZ4_COMPRESSION)
+                    .setTableFormatConfig(tableConfig);
+
+            List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
+            cfDescriptors.add(new ColumnFamilyDescriptor("default".getBytes(), cfOptions));
+            for (int i = 0; i < NUM_CF; i++) {
+                cfDescriptors.add(new ColumnFamilyDescriptor(("cf_" + i).getBytes(), cfOptions));
+            }
+
+            List<ColumnFamilyHandle> handles = new ArrayList<>();
+            this.db = RocksDB.open(dbOptions, dbPath, cfDescriptors, handles);
+            for (int i = 0; i < NUM_CF; i++) {
+                cfHandles[i] = handles.get(i + 1);
+            }
+            this.writeOptions = new WriteOptions().setDisableWAL(false).setSync(false);
+            this.readOptions = new ReadOptions();
+
         } catch (RocksDBException e) {
             System.err.println("NativeRocksDB cache clear failed: " + e.getMessage());
         }
