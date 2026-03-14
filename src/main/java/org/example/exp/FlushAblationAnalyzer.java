@@ -121,7 +121,7 @@ public class FlushAblationAnalyzer {
      * 表1：不同 Flush 策略在各错序率下的写放大
      */
     static void generateLatexWATable(Map<String, List<Record>> groups,
-                                      String outputDir) throws IOException {
+                                     String outputDir) throws IOException {
         try (PrintWriter pw = new PrintWriter(
                 new FileWriter(outputDir + "/table_wa.tex"))) {
             pw.println("\\begin{table}[htbp]");
@@ -168,7 +168,7 @@ public class FlushAblationAnalyzer {
      * 表2：不同 Flush 策略在各错序率下的写入吞吐量
      */
     static void generateLatexThroughputTable(Map<String, List<Record>> groups,
-                                              String outputDir) throws IOException {
+                                             String outputDir) throws IOException {
         try (PrintWriter pw = new PrintWriter(
                 new FileWriter(outputDir + "/table_throughput.tex"))) {
             pw.println("\\begin{table}[htbp]");
@@ -216,7 +216,7 @@ public class FlushAblationAnalyzer {
      * 表3：读取性能对比（固定 r=0.20）
      */
     static void generateLatexReadTable(Map<String, List<Record>> groups,
-                                        String outputDir) throws IOException {
+                                       String outputDir) throws IOException {
         try (PrintWriter pw = new PrintWriter(
                 new FileWriter(outputDir + "/table_read.tex"))) {
             pw.println("\\begin{table}[htbp]");
@@ -258,7 +258,7 @@ public class FlushAblationAnalyzer {
      * 可用 gnuplot 或 matplotlib 绘制
      */
     static void generatePlotData(Map<String, List<Record>> groups,
-                                  String outputDir) throws IOException {
+                                 String outputDir) throws IOException {
         try (PrintWriter pw = new PrintWriter(
                 new FileWriter(outputDir + "/plot_wa_vs_disorder.dat"))) {
             pw.println("# disorder_rate  DEFAULT_WA  DEFAULT_std  FRAG_WA  FRAG_std  FRAG_BA_WA  FRAG_BA_std");

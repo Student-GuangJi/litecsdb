@@ -26,7 +26,7 @@
                     </descriptorRefs>
                     <archive>
                         <manifest>
-                            <mainClass>org.example.Experiment1Runner</mainClass>
+                            <mainClass>org.example.exp.Experiment1Runner</mainClass>
                         </manifest>
                     </archive>
                 </configuration>

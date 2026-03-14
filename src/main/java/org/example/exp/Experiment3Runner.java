@@ -1,5 +1,6 @@
-package org.example;
+package org.example.exp;
 
+import org.example.MainNode;
 import org.example.RocksDBServer.*;
 import org.example.MainNode.*;
 
@@ -314,11 +315,11 @@ public class Experiment3Runner {
     // ==================== 桶统计 ====================
 
     public static class BucketStats {
-        long totalBuckets;
-        long totalObjects;
-        double bucketsPerObject;
-        double avgBucketSize;
-        double avgIntraBucketVariance;
+        public long totalBuckets;
+        public long totalObjects;
+        public double bucketsPerObject;
+        public double avgBucketSize;
+        public double avgIntraBucketVariance;
     }
 
     private static BucketStats collectBucketStats(MainNode system) {

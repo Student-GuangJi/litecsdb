@@ -2,6 +2,7 @@ package org.example;
 
 import org.example.RocksDBServer.*;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.TickerType;
 
 import java.io.File;
 import java.util.*;
@@ -30,6 +31,14 @@ public class StorageNode {
         this.queryExecutor = Executors.newFixedThreadPool(8);
         this.queryCounter = new AtomicInteger(0);
         this.performanceStats = new ConcurrentHashMap<>();
+    }
+
+    public long getAggregatedTickerCount(TickerType ticker) {
+        long total = 0;
+        for (RocksDBServer db : healpixDatabases.values()) {
+            total += db.getTickerCount(ticker);
+        }
+        return total;
     }
     /**
      * 使用时间桶的高效查询
@@ -135,6 +144,17 @@ public class StorageNode {
             } catch (Exception e) {
                 e.printStackTrace();
             }
+        }
+    }
+
+    // 获取指定 HEALPix 分区内的所有天体元数据
+    public List<RocksDBServer.StarMetadata> getAllStarsInHealpix(long healpixId) {
+        RocksDBServer dbService = healpixDatabases.get(healpixId);
+        if (dbService == null) return Collections.emptyList();
+        try {
+            return dbService.getAllStarsMetadata();
+        } catch (Exception e) {
+            return Collections.emptyList();
         }
     }
 

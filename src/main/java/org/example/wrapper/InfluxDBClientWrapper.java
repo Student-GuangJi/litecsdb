@@ -9,6 +9,9 @@ import com.influxdb.client.InfluxDBClientFactory;
 import com.influxdb.client.WriteApiBlocking;
 import com.influxdb.client.domain.WritePrecision;
 import com.influxdb.client.InfluxDBClientOptions;
+import com.influxdb.client.domain.Bucket;
+import com.influxdb.client.domain.BucketRetentionRules;
+import com.influxdb.client.domain.Organization;
 import healpix.RangeSet;
 import okhttp3.OkHttpClient;
 
@@ -250,6 +253,11 @@ public class InfluxDBClientWrapper implements AutoCloseable {
             }
             return Math.max(0, count - 1);
         } catch (Exception e) { return 0; }
+    }
+
+    // 将 Gaia 时间（MJD 天数）转换为 InfluxDB 纳秒时间戳
+    public long gaiaToInfluxNs(double gaiaTime) {
+        return (GAIA_EPOCH_UNIX_MS + (long)(gaiaTime * MS_PER_DAY)) * 1_000_000L;
     }
 
     // ==================== 批量并行查询接口 ====================
@@ -500,6 +508,62 @@ public class InfluxDBClientWrapper implements AutoCloseable {
         long currentDirSize = StorageUtils.getDirectorySize(dataDir);
         long physical = currentDirSize - initialDirSize;
         return physical > 0 ? (double) physical / logical : 1.0;
+    }
+    /**
+     * 确保 bucket 存在，不存在则创建
+     */
+    public void ensureBucketExists() {
+        try {
+            // 检查是否已存在
+            Bucket existing = clients[0].getBucketsApi().findBucketByName(bucket);
+            if (existing != null) {
+                System.out.println("[InfluxDB] Bucket already exists: " + bucket);
+                return;
+            }
+
+            // 查找 orgID
+            String orgID = null;
+            for (Organization o : clients[0].getOrganizationsApi().findOrganizations()) {
+                if (o.getName().equals(org)) {
+                    orgID = o.getId();
+                    break;
+                }
+            }
+            if (orgID == null) {
+                System.err.println("[InfluxDB] Cannot find org: " + org);
+                return;
+            }
+
+            // 创建 bucket（retention=0 永不过期）
+            BucketRetentionRules retention = new BucketRetentionRules();
+            retention.setEverySeconds(0);
+
+            Bucket newBucket = new Bucket();
+            newBucket.setName(bucket);
+            newBucket.setOrgID(orgID);
+            newBucket.setRetentionRules(Collections.singletonList(retention));
+
+            clients[0].getBucketsApi().createBucket(newBucket);
+            System.out.println("[InfluxDB] Created bucket: " + bucket);
+
+        } catch (Exception e) {
+            System.err.println("[InfluxDB] ensureBucketExists failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 删除 bucket（实验结束清理用）
+     */
+    public void deleteBucket() {
+        try {
+            Bucket b = clients[0].getBucketsApi().findBucketByName(bucket);
+            if (b != null) {
+                clients[0].getBucketsApi().deleteBucket(b);
+                System.out.println("[InfluxDB] Deleted bucket: " + bucket);
+            }
+        } catch (Exception e) {
+            System.err.println("[InfluxDB] deleteBucket failed: " + e.getMessage());
+        }
     }
 
     public void clearData() {

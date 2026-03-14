@@ -1,5 +1,7 @@
-package org.example;
+package org.example.exp;
 
+import org.example.MainNode;
+import org.example.RocksDBGlobalResourceManager;
 import org.example.wrapper.*;
 import org.example.RocksDBServer.LightCurvePoint;
 
@@ -201,7 +203,7 @@ public class Experiment1Runner {
     private static void requireDir(String dp, String msg) { if (!new File(dp).isDirectory()) throw new IllegalArgumentException(msg + ": " + dp); }
 
     private static void printUsage() {
-        System.out.println("用法: java org.example.Experiment1Runner [options]");
+        System.out.println("用法: java org.example.exp.Experiment1Runner [options]");
         System.out.println("  --mode, -m      batch|incremental|both (默认 both)");
         System.out.println("  --size, -s      数据规模标识");
         System.out.println("  --baseDir, -d   生成数据集根目录 (默认 generated_datasets)");

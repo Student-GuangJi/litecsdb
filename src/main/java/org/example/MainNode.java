@@ -2,8 +2,12 @@ package org.example;
 
 import healpix.RangeSet;
 import org.example.RocksDBServer.*;
+import org.example.exp.Experiment3Runner;
+import org.example.exp.FlushAblationExperiment;
+import org.example.exp.FlushAblationExperiment.FlushStrategy;
 import org.example.utils.HealpixUtil;
 import org.example.StorageNode.*;
+import org.rocksdb.TickerType;
 
 import java.io.File;
 import java.util.*;
@@ -27,7 +31,11 @@ public class MainNode {
 
     private final ExecutorService distributionExecutor;
     private final ExecutorService writeExecutor;
+    private FlushStrategy pendingFlushStrategy = null;
 
+    public void setFlushStrategy(FlushStrategy strategy) {
+        this.pendingFlushStrategy = strategy;
+    }
     public MainNode(int nodesCount, int level) {
         this(nodesCount, level, DEFAULT_BASE_PATH);
     }
@@ -318,11 +326,27 @@ public class MainNode {
             String dbPath = String.format(basePath + "node%d/healpix_%d", healpixId % nodesCount, healpixId);
             RocksDBServer.Config config = new RocksDBServer.Config(dbPath, healpixId);
             config.timeBucketSize = 1;
+
+            if (pendingFlushStrategy != null) {
+                FlushAblationExperiment.applyFlushStrategy(config, pendingFlushStrategy);
+            }
+
             node.initializeHealpixDatabase(healpixId, config);
         }
     }
 
     // ==================== Query methods (unchanged) ====================
+
+    // (2) 暴露锥形检索的 HEALPix 像素集合计算（已有 private 方法，改为 public）
+    public Set<Long> calculateHealpixIdsInConePublic(double ra, double dec, double radius) {
+        return calculateHealpixIdsInCone(ra, dec, radius);
+    }
+
+    // (3) 暴露 StorageNode 的访问（供查询实验按分区遍历天体）
+    public StorageNode getStorageNode(long healpixId) {
+        int idx = (int) (healpixId % nodesCount);
+        return idx >= 0 && idx < storageNodes.size() ? storageNodes.get(idx) : null;
+    }
 
     /**
      * STMK 分布式查询入口（论文 Algorithm 2 的完整实现）
@@ -532,6 +556,14 @@ public class MainNode {
         StorageNode node = storageNodes.get((int) (healpixId % nodesCount));
         if (node == null) return Collections.emptyList();
         return node.getLightCurve(healpixId, sourceId, band);
+    }
+
+    public long getAggregatedTickerCount(TickerType ticker) {
+        long total = 0;
+        for (StorageNode node : storageNodes) {
+            total += node.getAggregatedTickerCount(ticker);
+        }
+        return total;
     }
 
     /** 详细桶统计（含桶大小标准差） */
